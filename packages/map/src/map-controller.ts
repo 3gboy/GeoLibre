@@ -507,7 +507,10 @@ export class MapController {
   }
 
   fitLayer(layer: GeoLibreLayer): void {
-    const bounds = getLayerBounds(layer);
+    const bounds =
+      getLayerBounds(layer) ??
+      this.getLayerMetadataBounds(layer) ??
+      this.getLayerSourceBounds(layer);
     if (!bounds || !this.map) return;
     this.map.fitBounds(
       [
