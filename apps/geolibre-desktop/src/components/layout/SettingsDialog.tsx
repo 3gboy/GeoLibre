@@ -92,6 +92,7 @@ interface DraftPreferences {
 
 interface DraftDesktopSettings {
   layout: DesktopLayoutSettings;
+  shareToken: string;
 }
 
 function createDraftId(): string {
@@ -113,6 +114,7 @@ function clonePreferences(preferences: ProjectPreferences): DraftPreferences {
 function cloneDesktopSettings(settings: DesktopSettings): DraftDesktopSettings {
   return {
     layout: { ...settings.layout },
+    shareToken: settings.shareToken,
   };
 }
 
@@ -347,6 +349,13 @@ export function SettingsDialog({
     updateDraftLayoutSettings(DEFAULT_DESKTOP_LAYOUT_SETTINGS);
   };
 
+  const updateShareToken = (value: string) => {
+    // Kept in the draft and only committed on Save, so editing the token and
+    // then closing the dialog without saving discards the change (a secret
+    // field should not persist on every keystroke).
+    setDraftDesktopSettings((current) => ({ ...current, shareToken: value }));
+  };
+
   const saveSettings = () => {
     const normalized = normalizePreferences(draftPreferences);
     const validationError = validateEnvironmentVariables(
@@ -366,6 +375,7 @@ export function SettingsDialog({
     setDesktopSettings({
       ...useDesktopSettingsStore.getState().desktopSettings,
       layout: draftDesktopSettings.layout,
+      shareToken: draftDesktopSettings.shareToken,
     });
     setOpen(false);
   };
@@ -776,7 +786,41 @@ export function SettingsDialog({
               ) : null}
               {section === "environment" ? (
                 <div className="space-y-5">
-                  <div className="flex items-center justify-between gap-3">
+                  <div className="space-y-2">
+                    <h3 className="text-sm font-semibold">
+                      Share.GeoLibre API token
+                    </h3>
+                    <p className="text-xs text-muted-foreground">
+                      Used by Project &gt; Share to upload projects to
+                      share.geolibre.app. Create one under Settings &gt; API
+                      tokens at{" "}
+                      <a
+                        className="underline"
+                        href="https://share.geolibre.app/settings"
+                        target="_blank"
+                        rel="noreferrer noopener"
+                      >
+                        share.geolibre.app/settings
+                      </a>
+                      .
+                    </p>
+                    <Input
+                      aria-label="Share.GeoLibre API token"
+                      type="password"
+                      autoComplete="new-password"
+                      placeholder="glb_…"
+                      value={draftDesktopSettings.shareToken}
+                      onChange={(event) => updateShareToken(event.target.value)}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Stored locally on this device and sent only to
+                      share.geolibre.app to authenticate uploads. On the web
+                      build it shares the same browser storage as other site
+                      data, so revoke it on share.geolibre.app if your machine
+                      is compromised.
+                    </p>
+                  </div>
+                  <div className="flex items-center justify-between gap-3 border-t pt-5">
                     <div>
                       <h3 className="text-sm font-semibold">
                         Environment variables
