@@ -8,6 +8,15 @@ import {
   addArcGISLayer,
   type ArcGISLayerType,
   type ArcGISSourceType,
+  createDeckVizStoreLayer,
+  DECK_VIZ_CATEGORY_LABELS,
+  DEFAULT_DECK_VIZ_STYLE,
+  ensureMercatorProjection,
+  getDeckVizLayerDef,
+  listDeckVizLayerDefs,
+  type DeckVizCategory,
+  type DeckVizFieldMapping,
+  type DeckVizStyle,
 } from "@geolibre/plugins";
 import {
   Button,
@@ -42,6 +51,12 @@ import {
   parseDelimitedTextFields,
   parseDelimitedTextLayer,
 } from "../../lib/delimited-text";
+import {
+  autoDetectFieldMapping,
+  computeDeckVizBounds,
+  type DeckVizParsedInput,
+  detectAndParseDeckVizInput,
+} from "../../lib/deck-viz-input";
 import { parseGpxLayer } from "../../lib/gpx";
 import {
   createWfsGetFeatureUrl,
@@ -80,6 +95,7 @@ export type AddDataKind =
   | "mbtiles"
   | "arcgis"
   | "postgres"
+  | "deckgl-viz"
   | "video";
 
 interface AddDataDialogProps {
@@ -93,6 +109,10 @@ type GpxLayerKind = "waypoints" | "tracks" | "routes";
 type DelimitedTextMode = "url" | "file";
 type DelimitedTextDelimiter = "comma" | "tab" | "semicolon" | "pipe" | "custom";
 
+// ~10 MB; deck-viz data is stored inline in the project file, so warn (but do
+// not block) when a very large payload would bloat saved projects.
+const DECK_VIZ_SIZE_WARN_BYTES = 10 * 1024 * 1024;
+
 const KIND_LABELS: Record<AddDataKind, string> = {
   xyz: "Add XYZ Layer",
   wms: "Add WMS Layer",
@@ -103,6 +123,7 @@ const KIND_LABELS: Record<AddDataKind, string> = {
   mbtiles: "Add MBTiles Layer",
   arcgis: "Add ArcGIS Layer",
   postgres: "Add PostgreSQL Layer",
+  "deckgl-viz": "Add Deck.gl Layer",
   video: "Add Video Layer",
 };
 
@@ -464,6 +485,20 @@ export function AddDataDialog({
   const [martinStatus, setMartinStatus] = useState<string | null>(null);
   const martinLayerAddedRef = useRef(false);
 
+  const [deckVizKind, setDeckVizKind] = useState("scatterplot");
+  const [deckVizMode, setDeckVizMode] = useState<"url" | "file">("url");
+  const [deckVizUrl, setDeckVizUrl] = useState("");
+  const [deckVizSourcePath, setDeckVizSourcePath] = useState("");
+  const [deckVizParsed, setDeckVizParsed] = useState<DeckVizParsedInput | null>(
+    null,
+  );
+  const [deckVizMapping, setDeckVizMapping] = useState<DeckVizFieldMapping>({});
+  const [deckVizStyle, setDeckVizStyle] = useState<DeckVizStyle>({
+    ...DEFAULT_DECK_VIZ_STYLE,
+  });
+  const [deckVizStatus, setDeckVizStatus] = useState<string | null>(null);
+  const [isLoadingDeckViz, setIsLoadingDeckViz] = useState(false);
+
   useEffect(() => {
     if (!kind) return;
     if (kind === "postgres" && !martinServer) martinLayerAddedRef.current = false;
@@ -480,6 +515,8 @@ export function AddDataDialog({
         mbtiles: "MBTiles Layer",
         arcgis: "ArcGIS Layer",
         postgres: "PostgreSQL Layer",
+        // Matches the deckVizKind reset to "scatterplot" below.
+        "deckgl-viz": getDeckVizLayerDef("scatterplot")?.label ?? "Deck.gl Layer",
         video: "Video Layer",
       }[kind],
     );
@@ -545,6 +582,20 @@ export function AddDataDialog({
       setSelectedMartinSourceId("");
       setMartinStatus(null);
     }
+    // The deck.gl overlay only aligns in a Mercator viewport, so switch away
+    // from globe as soon as the Deck.gl Layer dialog opens.
+    if (kind === "deckgl-viz") {
+      ensureMercatorProjection(mapControllerRef.current?.getMap());
+    }
+    setDeckVizKind("scatterplot");
+    setDeckVizMode("url");
+    setDeckVizUrl("");
+    setDeckVizSourcePath("");
+    setDeckVizParsed(null);
+    setDeckVizMapping({});
+    setDeckVizStyle({ ...DEFAULT_DECK_VIZ_STYLE });
+    setDeckVizStatus(null);
+    setIsLoadingDeckViz(false);
   }, [kind]);
 
   const description = useMemo(() => {
@@ -577,6 +628,9 @@ export function AddDataDialog({
     }
     if (kind === "video") {
       return "Add a georeferenced video overlay by supplying an MP4 URL and four corner coordinates.";
+    }
+    if (kind === "deckgl-viz") {
+      return "Pick a deck.gl layer type, then load the example data or upload a CSV/JSON/GeoJSON file or URL.";
     }
     return "";
   }, [kind]);
@@ -730,6 +784,191 @@ export function AddDataDialog({
   };
 
   const beforeLayer = beforeLayerId.trim() || null;
+
+  const deckVizDef = getDeckVizLayerDef(deckVizKind);
+
+  const handleDeckVizKindChange = (nextKind: string) => {
+    setDeckVizKind(nextKind);
+    setDeckVizParsed(null);
+    setDeckVizMapping({});
+    setDeckVizStatus(null);
+    setError(null);
+    setDeckVizStyle({ ...DEFAULT_DECK_VIZ_STYLE });
+    setLayerName(getDeckVizLayerDef(nextKind)?.label ?? "Deck.gl Layer");
+  };
+
+  const readDeckVizSource = async (): Promise<{
+    sourcePath: string;
+    text: string;
+  }> => {
+    let source: { sourcePath: string; text: string };
+    if (deckVizMode === "file") {
+      const selected = await openLocalDataFileWithFallback({
+        filters: [
+          {
+            name: "Data",
+            extensions: ["csv", "tsv", "txt", "json", "geojson"],
+          },
+        ],
+        accept: ".csv,.tsv,.txt,.json,.geojson",
+        readText: true,
+      });
+      if (!selected?.text) throw new Error("Choose a CSV, JSON, or GeoJSON file.");
+      source = { sourcePath: selected.path, text: selected.text };
+    } else {
+      const sourcePath = deckVizUrl.trim();
+      if (!sourcePath) throw new Error("Enter a data URL.");
+      const response = await fetch(sourcePath);
+      if (!response.ok) {
+        throw new Error(`Request failed with status ${response.status}`);
+      }
+      source = { sourcePath, text: await response.text() };
+    }
+    if (source.text.length > DECK_VIZ_SIZE_WARN_BYTES) {
+      console.warn(
+        "[GeoLibre] deck-viz: large payload stored inline in the project",
+        source.text.length,
+        "bytes",
+      );
+    }
+    return source;
+  };
+
+  // Validates format/role completeness, then writes the deck-viz store layer
+  // and fits the map. Shared by the "Use example data" and submit paths.
+  const finalizeDeckVizLayer = (params: {
+    parsed: DeckVizParsedInput;
+    mapping: DeckVizFieldMapping;
+    style: DeckVizStyle;
+    sourcePath: string;
+  }) => {
+    const def = getDeckVizLayerDef(deckVizKind);
+    if (!def) throw new Error("Unknown layer type.");
+    const { parsed, mapping, style, sourcePath } = params;
+
+    if (def.format === "geojson" && parsed.format !== "geojson") {
+      throw new Error(`${def.label} needs a GeoJSON file.`);
+    }
+    if (def.format !== "geojson" && parsed.format === "geojson") {
+      throw new Error(`${def.label} needs tabular CSV/JSON data, not GeoJSON.`);
+    }
+    const missing = def.roles.filter(
+      (role) =>
+        role.required &&
+        (mapping[role.key] === undefined || mapping[role.key] === ""),
+    );
+    if (missing.length > 0) {
+      throw new Error(
+        `Map the required field${missing.length > 1 ? "s" : ""}: ${missing
+          .map((role) => role.label)
+          .join(", ")}.`,
+      );
+    }
+
+    const bounds =
+      parsed.format === "geojson"
+        ? undefined
+        : (computeDeckVizBounds(parsed.rows ?? [], mapping) ?? undefined);
+    const layer = createDeckVizStoreLayer({
+      name: layerName.trim() || def.label,
+      config: {
+        layerKind: def.kind,
+        format: parsed.format,
+        fieldMapping: mapping,
+        style,
+      },
+      rows: parsed.format === "geojson" ? undefined : parsed.rows,
+      geojson: parsed.geojson,
+      sourcePath,
+      bounds,
+    });
+    addLayer(layer, beforeLayer);
+    // GeoJSON fits from its geometry; row-based layers fit from the stored
+    // bounds (also used by the layer panel's "Zoom to layer").
+    if (def.format === "geojson") {
+      mapControllerRef.current?.fitLayer(layer);
+    } else if (bounds) {
+      mapControllerRef.current?.fitBounds(bounds);
+    }
+    closeDialog();
+  };
+
+  const handleUseDeckVizExample = async () => {
+    const def = getDeckVizLayerDef(deckVizKind);
+    if (!def) return;
+    setError(null);
+    setDeckVizStatus(null);
+    setIsLoadingDeckViz(true);
+    try {
+      const response = await fetch(def.example.url);
+      if (!response.ok) {
+        throw new Error(`Request failed with status ${response.status}`);
+      }
+      const parsed = detectAndParseDeckVizInput(await response.text());
+      finalizeDeckVizLayer({
+        parsed,
+        mapping: def.example.fieldMapping,
+        style: { ...DEFAULT_DECK_VIZ_STYLE, ...(def.example.style ?? {}) },
+        sourcePath: def.example.url,
+      });
+    } catch (err) {
+      setError(errorMessage(err, "Could not load the example data."));
+    } finally {
+      setIsLoadingDeckViz(false);
+    }
+  };
+
+  const handleRetrieveDeckVizColumns = async () => {
+    const def = getDeckVizLayerDef(deckVizKind);
+    if (!def) return;
+    setError(null);
+    setDeckVizStatus(null);
+    setIsLoadingDeckViz(true);
+    try {
+      const { sourcePath, text } = await readDeckVizSource();
+      const parsed = detectAndParseDeckVizInput(text);
+      if (def.format === "geojson" && parsed.format !== "geojson") {
+        throw new Error(`${def.label} needs a GeoJSON file.`);
+      }
+      if (def.format !== "geojson" && parsed.format === "geojson") {
+        throw new Error(`${def.label} needs tabular CSV/JSON data, not GeoJSON.`);
+      }
+      setDeckVizParsed(parsed);
+      setDeckVizSourcePath(sourcePath);
+      setDeckVizMapping(autoDetectFieldMapping(def.roles, parsed.columns));
+      setDeckVizStatus(
+        parsed.format === "geojson"
+          ? `Loaded ${parsed.rowCount} feature${parsed.rowCount === 1 ? "" : "s"}.`
+          : `Loaded ${parsed.rowCount} row${
+              parsed.rowCount === 1 ? "" : "s"
+            } · ${parsed.columns.length} column${
+              parsed.columns.length === 1 ? "" : "s"
+            }.`,
+      );
+    } catch (err) {
+      setError(errorMessage(err, "Could not load the data."));
+      setDeckVizParsed(null);
+    } finally {
+      setIsLoadingDeckViz(false);
+    }
+  };
+
+  const setDeckVizRole = (roleKey: string, value: string) => {
+    setDeckVizMapping((current) => {
+      const next = { ...current };
+      if (value === "") {
+        delete next[roleKey];
+        return next;
+      }
+      // Numeric columns (JSON tuple arrays) are stored as indices.
+      const numeric = Number(value);
+      next[roleKey] =
+        deckVizParsed?.format === "json-array" && Number.isFinite(numeric)
+          ? numeric
+          : value;
+      return next;
+    });
+  };
 
   // Computed during render (not memoized) so the list picks up the map
   // controller once it finishes initialising; the call is a cheap filter.
@@ -959,6 +1198,19 @@ export function AddDataDialog({
 
     try {
       const name = layerName.trim() || KIND_LABELS[kind].replace("Add ", "");
+
+      if (kind === "deckgl-viz") {
+        if (!deckVizParsed) {
+          throw new Error("Load the example data, or a file/URL, first.");
+        }
+        finalizeDeckVizLayer({
+          parsed: deckVizParsed,
+          mapping: deckVizMapping,
+          style: deckVizStyle,
+          sourcePath: deckVizSourcePath,
+        });
+        return;
+      }
 
       if (kind === "xyz") {
         if (!xyzUrl.trim()) throw new Error("Enter an XYZ tile URL template.");
@@ -1373,8 +1625,10 @@ export function AddDataDialog({
   const addLayerDisabled =
     isSubmitting ||
     isRetrievingDelimitedTextColumns ||
+    isLoadingDeckViz ||
     (kind === "gpx" && !hasSelectedGpxLayerKind) ||
     (kind === "delimited-text" && missingCustomDelimiter) ||
+    (kind === "deckgl-viz" && !deckVizParsed) ||
     (kind === "postgres" && (!martinServer || !selectedMartinSourceId));
 
   return (
@@ -1461,6 +1715,233 @@ export function AddDataDialog({
                 />
                 Short URL
               </label>
+            </div>
+          )}
+
+          {kind === "deckgl-viz" && (
+            <div className="space-y-3">
+              <div className="space-y-1.5">
+                <Label htmlFor="deckviz-kind">Layer type</Label>
+                <Select
+                  id="deckviz-kind"
+                  value={deckVizKind}
+                  disabled={isLoadingDeckViz}
+                  onChange={(event) =>
+                    handleDeckVizKindChange(event.target.value)
+                  }
+                >
+                  {(
+                    Object.keys(DECK_VIZ_CATEGORY_LABELS) as DeckVizCategory[]
+                  ).map((category) => (
+                    <optgroup
+                      key={category}
+                      label={DECK_VIZ_CATEGORY_LABELS[category]}
+                    >
+                      {listDeckVizLayerDefs()
+                        .filter((def) => def.category === category)
+                        .map((def) => (
+                          <option key={def.kind} value={def.kind}>
+                            {def.label}
+                          </option>
+                        ))}
+                    </optgroup>
+                  ))}
+                </Select>
+                {deckVizDef ? (
+                  <p className="text-xs text-muted-foreground">
+                    {deckVizDef.description}
+                  </p>
+                ) : null}
+              </div>
+
+              <Button
+                type="button"
+                variant="outline"
+                onClick={handleUseDeckVizExample}
+                disabled={isLoadingDeckViz}
+              >
+                <Globe2 className="mr-2 h-3.5 w-3.5" />
+                {isLoadingDeckViz ? "Loading..." : "Use example data"}
+              </Button>
+
+              <div className="space-y-1.5">
+                <Label htmlFor="deckviz-mode">Or load your own</Label>
+                <Select
+                  id="deckviz-mode"
+                  value={deckVizMode}
+                  disabled={isLoadingDeckViz}
+                  onChange={(event) => {
+                    setDeckVizMode(event.target.value as "url" | "file");
+                    setDeckVizParsed(null);
+                    setDeckVizStatus(null);
+                    setIsLoadingDeckViz(false);
+                  }}
+                >
+                  <option value="url">Data URL</option>
+                  <option value="file">Local file</option>
+                </Select>
+              </div>
+
+              {deckVizMode === "url" ? (
+                <div className="space-y-1.5">
+                  <Label htmlFor="deckviz-url">Data URL</Label>
+                  <Input
+                    id="deckviz-url"
+                    placeholder="https://example.com/data.csv"
+                    value={deckVizUrl}
+                    onChange={(event) => {
+                      setDeckVizUrl(event.target.value);
+                      setDeckVizParsed(null);
+                    }}
+                  />
+                </div>
+              ) : null}
+
+              <Button
+                type="button"
+                variant="outline"
+                onClick={handleRetrieveDeckVizColumns}
+                disabled={
+                  isLoadingDeckViz ||
+                  (deckVizMode === "url" && !deckVizUrl.trim())
+                }
+              >
+                {deckVizMode === "file" ? (
+                  <FileUp className="mr-2 h-3.5 w-3.5" />
+                ) : (
+                  <Columns3 className="mr-2 h-3.5 w-3.5" />
+                )}
+                {isLoadingDeckViz
+                  ? "Loading..."
+                  : deckVizMode === "file"
+                    ? "Choose file & load"
+                    : "Load data"}
+              </Button>
+              {deckVizStatus ? (
+                <p className="text-xs text-muted-foreground">{deckVizStatus}</p>
+              ) : null}
+
+              {deckVizParsed && deckVizDef && deckVizDef.roles.length > 0 ? (
+                <div className="grid gap-3 sm:grid-cols-2">
+                  {deckVizDef.roles.map((role) => (
+                    <div key={role.key} className="space-y-1.5">
+                      <Label htmlFor={`deckviz-role-${role.key}`}>
+                        {role.label}
+                      </Label>
+                      <Select
+                        id={`deckviz-role-${role.key}`}
+                        value={String(deckVizMapping[role.key] ?? "")}
+                        onChange={(event) =>
+                          setDeckVizRole(role.key, event.target.value)
+                        }
+                      >
+                        <option value="">
+                          {role.required ? "— select —" : "(none)"}
+                        </option>
+                        {deckVizParsed.columns.map((column) => (
+                          <option
+                            key={String(column.value)}
+                            value={String(column.value)}
+                          >
+                            {column.label}
+                          </option>
+                        ))}
+                      </Select>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+
+              {deckVizDef ? (
+                <div className="grid gap-3 sm:grid-cols-2">
+                  {deckVizDef.styleControls.includes("color") ? (
+                    <div className="space-y-1.5">
+                      <Label htmlFor="deckviz-color">Color</Label>
+                      <input
+                        id="deckviz-color"
+                        type="color"
+                        className="h-9 w-full rounded-md border border-input bg-background"
+                        value={deckVizStyle.color}
+                        onChange={(event) =>
+                          setDeckVizStyle((style) => ({
+                            ...style,
+                            color: event.target.value,
+                          }))
+                        }
+                      />
+                    </div>
+                  ) : null}
+                  {deckVizDef.styleControls.includes("radius") ? (
+                    <div className="space-y-1.5">
+                      <Label htmlFor="deckviz-radius">Point size</Label>
+                      <Input
+                        id="deckviz-radius"
+                        inputMode="numeric"
+                        value={String(deckVizStyle.radius)}
+                        onChange={(event) =>
+                          setDeckVizStyle((style) => ({
+                            ...style,
+                            radius: Number.isFinite(Number(event.target.value))
+                              ? Number(event.target.value)
+                              : style.radius,
+                          }))
+                        }
+                      />
+                    </div>
+                  ) : null}
+                  {deckVizDef.styleControls.includes("cellSize") ? (
+                    <div className="space-y-1.5">
+                      <Label htmlFor="deckviz-cellsize">Cell size</Label>
+                      <Input
+                        id="deckviz-cellsize"
+                        inputMode="numeric"
+                        value={String(deckVizStyle.cellSize)}
+                        onChange={(event) =>
+                          setDeckVizStyle((style) => ({
+                            ...style,
+                            cellSize: Number.isFinite(Number(event.target.value))
+                              ? Number(event.target.value)
+                              : style.cellSize,
+                          }))
+                        }
+                      />
+                    </div>
+                  ) : null}
+                  {deckVizDef.styleControls.includes("lineWidth") ? (
+                    <div className="space-y-1.5">
+                      <Label htmlFor="deckviz-linewidth">Line width</Label>
+                      <Input
+                        id="deckviz-linewidth"
+                        inputMode="numeric"
+                        value={String(deckVizStyle.lineWidth)}
+                        onChange={(event) =>
+                          setDeckVizStyle((style) => ({
+                            ...style,
+                            lineWidth: Number.isFinite(Number(event.target.value))
+                              ? Number(event.target.value)
+                              : style.lineWidth,
+                          }))
+                        }
+                      />
+                    </div>
+                  ) : null}
+                  {deckVizDef.styleControls.includes("extruded") ? (
+                    <label className="flex items-center gap-2 self-end pb-2 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={deckVizStyle.extruded}
+                        onChange={(event) =>
+                          setDeckVizStyle((style) => ({
+                            ...style,
+                            extruded: event.target.checked,
+                          }))
+                        }
+                      />
+                      3D extrusion
+                    </label>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
           )}
 

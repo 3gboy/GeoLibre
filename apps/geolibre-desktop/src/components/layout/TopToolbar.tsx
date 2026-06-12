@@ -1043,6 +1043,9 @@ export function TopToolbar({
           <DropdownMenuItem onSelect={() => setAddDataKind("video")}>
             Video Layer
           </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => setAddDataKind("deckgl-viz")}>
+            Deck.gl Layer
+          </DropdownMenuItem>
           <DropdownMenuSeparator />
           <DropdownMenuLabel className="text-xs text-muted-foreground">
             Cloud formats
