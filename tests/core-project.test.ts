@@ -3,6 +3,7 @@ import { beforeEach, describe, it } from "node:test";
 import {
   DEFAULT_BASEMAP,
   DEFAULT_LAYER_STYLE,
+  DEFAULT_STORY_MAP,
   createEmptyProject,
   createSampleStoryMap,
   parseProject,
@@ -89,6 +90,8 @@ describe("project parsing", () => {
     assert.equal(project.preferences.map.minZoom, 0);
     assert.equal(project.preferences.map.maxZoom, 18);
     assert.equal(project.preferences.map.renderWorldCopies, false);
+    // Projects saved before projection was persisted default to globe.
+    assert.equal(project.preferences.map.projection, "globe");
     assert.deepEqual(project.preferences.environmentVariables, [
       { key: "VALID_KEY", value: "1", enabled: true },
     ]);
@@ -103,6 +106,19 @@ describe("project parsing", () => {
     assert.deepEqual(project.plugins?.settings, {
       "maplibre-gl-swipe": { position: 50 },
     });
+  });
+
+  it("round-trips the map projection preference", () => {
+    const base = createEmptyProject("Projection");
+    const mercator = {
+      ...base,
+      preferences: {
+        ...base.preferences,
+        map: { ...base.preferences.map, projection: "mercator" as const },
+      },
+    };
+    const reloaded = parseProject(serializeProject(mercator));
+    assert.equal(reloaded.preferences.map.projection, "mercator");
   });
 
   it("normalizes a legend config, dropping malformed overrides", () => {
@@ -477,6 +493,56 @@ describe("story maps", () => {
       useAppStore.getState().storymap?.chapters.map((c) => c.id),
       ["chapter-1", "chapter-2"],
     );
+    // A project that ships a story opens straight into the presentation.
+    assert.equal(useAppStore.getState().ui.storymapPresenting, true);
+  });
+
+  it("opens a story-less project without presenting", () => {
+    // Start with a presentation active to prove load clears it.
+    useAppStore.getState().setStorymapPresenting(true);
+    const empty = parseProject(serializeProject(createEmptyProject("Plain")));
+    useAppStore.getState().loadProject(empty);
+    assert.equal(useAppStore.getState().ui.storymapPresenting, false);
+  });
+
+  it("does not present a story that has no chapters", () => {
+    useAppStore.getState().setStorymapPresenting(true);
+    // A settings-only story survives normalization as a non-null storymap with
+    // an empty chapters array, distinct from "no storymap at all".
+    const withEmptyStory = parseProject(
+      serializeProject({
+        ...createEmptyProject("Settings-only story"),
+        storymap: { ...DEFAULT_STORY_MAP, title: "No chapters" },
+      }),
+    );
+    assert.ok(withEmptyStory.storymap);
+    assert.equal(withEmptyStory.storymap?.chapters.length, 0);
+    useAppStore.getState().loadProject(withEmptyStory);
+    assert.equal(useAppStore.getState().ui.storymapPresenting, false);
+  });
+
+  it("honors the presenting:false override for a story project", () => {
+    const store = useAppStore.getState();
+    store.addStoryChapter(chapter() as never);
+    const storyProject = parseProject(
+      serializeProject(
+        projectFromStore({
+          projectName: useAppStore.getState().projectName,
+          mapView: useAppStore.getState().mapView,
+          basemapStyleUrl: useAppStore.getState().basemapStyleUrl,
+          basemapVisible: useAppStore.getState().basemapVisible,
+          basemapOpacity: useAppStore.getState().basemapOpacity,
+          layers: useAppStore.getState().layers,
+          preferences: useAppStore.getState().preferences,
+          plugins: useAppStore.getState().projectPlugins,
+          storymap: useAppStore.getState().storymap,
+          metadata: useAppStore.getState().metadata,
+        }),
+      ),
+    );
+    // A caller opening the story for authoring can opt out of auto-presenting.
+    useAppStore.getState().loadProject(storyProject, null, { presenting: false });
+    assert.equal(useAppStore.getState().ui.storymapPresenting, false);
   });
 
   it("provides a sample story that survives normalization", () => {

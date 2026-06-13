@@ -7,6 +7,7 @@ import {
 import type {
   GeoLibreLayer,
   MapPreferences,
+  MapProjection,
   MapViewState,
   StoryChapterAnimation,
   StoryChapterLocation,
@@ -268,7 +269,7 @@ export class MapController {
     // redundant jumpTo that can interrupt the initial camera.
     const handleStyleReady = () => {
       this.styleReady = true;
-      this.enforceDefaultProjection();
+      this.enforceProjection();
       this.addTerrainSource();
       this.applyBasemapVisibility();
       this.applyBasemapOpacity();
@@ -276,7 +277,7 @@ export class MapController {
     };
     this.map.on("style.load", handleStyleReady);
     this.map.once("load", handleStyleReady);
-    this.map.once("idle", () => this.enforceDefaultProjection());
+    this.map.once("idle", () => this.enforceProjection());
     this.addNavigationControl();
     this.addFullscreenControl();
     this.addGeolocateControl();
@@ -334,6 +335,10 @@ export class MapController {
     // Invalidate any pending story rotation and halt an in-flight camera move so
     // a deferred rotateTo cannot fire after the presenter has exited.
     this.storyCameraToken++;
+    if (this.pendingRotateHandler) {
+      this.map?.off("moveend", this.pendingRotateHandler);
+      this.pendingRotateHandler = null;
+    }
     this.map?.stop();
     // Clear any opacity transitions left over from playback first, otherwise the
     // restored values animate back in (potentially over a multi-second fade).
@@ -355,6 +360,15 @@ export class MapController {
 
   /** Token guarding deferred story rotations against later chapter changes. */
   private storyCameraToken = 0;
+  /**
+   * The rotate-on-settle `moveend` listener currently awaiting its move, kept so
+   * it can be detached deterministically (on the next chapter or on presenter
+   * exit) instead of relying solely on self-removal, which never fires for an
+   * instant move whose `moveend` precedes attachment.
+   */
+  private pendingRotateHandler:
+    | ((event: maplibregl.MapLibreEvent & { storyCameraToken?: number }) => void)
+    | null = null;
 
   /**
    * Move the camera to a story chapter view during presentation playback.
@@ -380,20 +394,52 @@ export class MapController {
     // supersede an in-progress camera animation, and calling stop() immediately
     // before a new movement during rapid chapter changes can drop it entirely.
     const token = ++this.storyCameraToken;
-    map[animation]({
-      center: location.center,
-      zoom: location.zoom,
-      pitch: location.pitch,
-      bearing: location.bearing,
-    });
+    // Detach any rotate-on-settle listener still waiting on a superseded move so
+    // handlers can never accumulate across rapid chapter changes or a presenter
+    // exit. The matching listener for the new move is registered below.
+    if (this.pendingRotateHandler) {
+      map.off("moveend", this.pendingRotateHandler);
+      this.pendingRotateHandler = null;
+    }
+    // Tag the movement so the rotate-on-settle handler can recognize *this*
+    // move's `moveend`. When flyTo/easeTo supersedes a prior chapter's in-flight
+    // rotation, MapLibre fires a deferred `moveend` for that halted rotation; an
+    // untagged `once("moveend")` would catch it and start rotating immediately,
+    // around the previous chapter's center, before the new camera has travelled.
+    // MapLibre re-fires the original move's eventData on this deferred moveend
+    // (Camera._afterEase), so the token survives cancellation. The
+    // pendingRotateHandler cleanup above and in restoreLayerStyles is the
+    // backstop should that ever change, so handlers cannot leak regardless.
+    map[animation](
+      {
+        center: location.center,
+        zoom: location.zoom,
+        pitch: location.pitch,
+        bearing: location.bearing,
+      },
+      { storyCameraToken: token },
+    );
     if (rotate) {
-      map.once("moveend", () => {
+      const onMoveEnd = (
+        event: maplibregl.MapLibreEvent & { storyCameraToken?: number },
+      ) => {
+        // Only detach once the token matches. Stay attached through any
+        // preceding moveend (e.g. the deferred moveend of a halted prior
+        // rotateTo, which carries no storyCameraToken) so we can still react to
+        // this move's own matching moveend below.
+        if (event.storyCameraToken !== token) return;
+        map.off("moveend", onMoveEnd);
+        if (this.pendingRotateHandler === onMoveEnd) {
+          this.pendingRotateHandler = null;
+        }
         if (this.storyCameraToken !== token || !this.map) return;
         this.map.rotateTo(this.map.getBearing() + 180, {
           duration: 30000,
           easing: (time) => time,
         });
-      });
+      };
+      this.pendingRotateHandler = onMoveEnd;
+      map.on("moveend", onMoveEnd);
     }
   }
 
@@ -547,6 +593,9 @@ export class MapController {
     this.map.setMinZoom(minZoom);
     this.map.setMaxPitch(maxPitch);
     this.map.setRenderWorldCopies(preferences.renderWorldCopies);
+    // Reflect a changed projection preference (e.g. loading a project saved in
+    // mercator) onto the live map.
+    this.enforceProjection();
     this.map.setMaxBounds(mapBoundsForPreferences(preferences));
     this.map.setTransformConstrain(
       createMapTransformConstraint(preferences, this.map, minZoom, maxZoom),
@@ -795,13 +844,26 @@ export class MapController {
     this.syncHighlight(EMPTY_HIGHLIGHT);
   }
 
-  private enforceDefaultProjection(): void {
+  /** Current map projection, normalized to the two values we persist. */
+  readProjection(): MapProjection {
+    return this.map?.getProjection()?.type === "mercator"
+      ? "mercator"
+      : "globe";
+  }
+
+  /**
+   * Apply the projection from the active map preferences. Defaults to globe so
+   * projects saved before projection was persisted keep their previous look.
+   * Retries on the next idle if the style is not ready to accept it yet.
+   */
+  private enforceProjection(): void {
     if (!this.map) return;
+    const desired = this.mapPreferences.projection ?? DEFAULT_PROJECTION.type;
     try {
-      if (this.map.getProjection()?.type === DEFAULT_PROJECTION.type) return;
-      this.map.setProjection(DEFAULT_PROJECTION);
+      if (this.map.getProjection()?.type === desired) return;
+      this.map.setProjection({ type: desired });
     } catch {
-      this.map.once("idle", () => this.enforceDefaultProjection());
+      this.map.once("idle", () => this.enforceProjection());
     }
   }
 

@@ -625,9 +625,38 @@ export const MapCanvas = memo(function MapCanvas({
       onMapDiagnosticEventRef.current?.(mapErrorDiagnosticEvent(event));
     });
 
-    const updateView = (event?: { originalEvent?: unknown }) =>
+    const updateView = (event?: { originalEvent?: unknown }) => {
+      // While presenting a story map the presenter owns the camera. Syncing its
+      // transient chapter flies and rotations back into the store would both
+      // overwrite the saved project view and, worse, re-enter the applyView
+      // effect below: its jumpTo cancels an in-flight chapter fly, after which
+      // the rotate handler starts orbiting the previous chapter instead of the
+      // one just clicked. Skipping the sync keeps the presenter authoritative.
+      if (useAppStore.getState().ui.storymapPresenting) return;
       setMapView(mc.readView(), Boolean(event?.originalEvent));
+    };
     map.on("moveend", updateView);
+
+    // Persist projection toggles (the GlobeControl) into project preferences so
+    // a project reopens with the projection it was saved in. getProjection()
+    // returns the configured type, so the internal globe→mercator switch at high
+    // zoom (which also fires this event) leaves the stored preference unchanged.
+    const updateProjection = () => {
+      const projection = mc.readProjection();
+      // Functional update so a concurrent preference change (zoom-limit edit,
+      // loadProject) between read and write is not clobbered by a stale snapshot.
+      useAppStore.setState((s) => {
+        if (s.preferences.map.projection === projection) return s;
+        return {
+          preferences: {
+            ...s.preferences,
+            map: { ...s.preferences.map, projection },
+          },
+          isDirty: true,
+        };
+      });
+    };
+    map.on("projectiontransition", updateProjection);
     map.on("load", () => {
       mc.waitAndSyncLayers(useAppStore.getState().layers);
       mc.setBasemapVisible(useAppStore.getState().basemapVisible);
