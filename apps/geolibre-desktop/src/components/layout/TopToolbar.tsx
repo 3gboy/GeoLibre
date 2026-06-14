@@ -413,6 +413,7 @@ export function TopToolbar({
   const setNetworkToolOpen = useAppStore((s) => s.setNetworkToolOpen);
   const setGeocodeOpen = useAppStore((s) => s.setGeocodeOpen);
   const setRasterToolOpen = useAppStore((s) => s.setRasterToolOpen);
+  const setSegmentationOpen = useAppStore((s) => s.setSegmentationOpen);
   const setSqlWorkspaceOpen = useAppStore((s) => s.setSqlWorkspaceOpen);
   const setPythonConsoleOpen = useAppStore((s) => s.setPythonConsoleOpen);
   const setAssistantOpen = useAppStore((s) => s.setAssistantOpen);
@@ -1314,6 +1315,14 @@ export function TopToolbar({
       icon: MapPin,
       run: () => setGeocodeOpen(true),
     },
+    {
+      id: "proc.segmentation",
+      title: t("toolbar.command.segmentation"),
+      group: t("toolbar.commandGroup.processing"),
+      keywords: "segmentation samgeo sam3 ai segment imagery",
+      icon: Sparkles,
+      run: () => setSegmentationOpen(true),
+    },
     ...CONVERSION_COMMANDS.map(({ kind, titleKey }) => ({
       id: `proc.conversion.${kind}`,
       title: t(titleKey),
@@ -2115,6 +2124,9 @@ export function TopToolbar({
               </DropdownMenuItem>
             </DropdownMenuSubContent>
           </DropdownMenuSub>
+          <DropdownMenuItem onSelect={() => setSegmentationOpen(true)}>
+            {t("toolbar.command.segmentation")}
+          </DropdownMenuItem>
           <DropdownMenuItem onSelect={handleOpenPlanetaryComputerPanel}>
             {t("toolbar.command.planetaryComputer")}
           </DropdownMenuItem>
