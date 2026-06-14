@@ -127,6 +127,7 @@ export interface AppState {
     rasterToolOpen: RasterToolKind | null;
     geocodeOpen: boolean;
     sqlWorkspaceOpen: boolean;
+    pythonConsoleOpen: boolean;
     attributeTableOpen: boolean;
     storymapPanelOpen: boolean;
     storymapPresenting: boolean;
@@ -155,6 +156,7 @@ export interface AppState {
   setRasterToolOpen: (kind: RasterToolKind | null) => void;
   setGeocodeOpen: (open: boolean) => void;
   setSqlWorkspaceOpen: (open: boolean) => void;
+  setPythonConsoleOpen: (open: boolean) => void;
   setAttributeTableOpen: (open: boolean) => void;
   setStorymapPanelOpen: (open: boolean) => void;
   setStorymapPresenting: (presenting: boolean) => void;
@@ -316,6 +318,7 @@ export const useAppStore = create<AppState>()(
         rasterToolOpen: null,
         geocodeOpen: false,
         sqlWorkspaceOpen: false,
+        pythonConsoleOpen: false,
         attributeTableOpen: false,
         storymapPanelOpen: false,
         storymapPresenting: false,
@@ -361,6 +364,8 @@ export const useAppStore = create<AppState>()(
         set((s) => ({ ui: { ...s.ui, geocodeOpen: open } })),
       setSqlWorkspaceOpen: (open) =>
         set((s) => ({ ui: { ...s.ui, sqlWorkspaceOpen: open } })),
+      setPythonConsoleOpen: (open) =>
+        set((s) => ({ ui: { ...s.ui, pythonConsoleOpen: open } })),
       setAttributeTableOpen: (open) =>
         set((s) => ({ ui: { ...s.ui, attributeTableOpen: open } })),
       setStorymapPanelOpen: (open) =>
