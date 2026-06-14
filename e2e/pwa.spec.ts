@@ -46,6 +46,28 @@ test("registers a service worker and serves the shell offline after first visit"
   page,
   context,
 }) => {
+  // This test chains several long, sequential waits whose explicit ceilings sum
+  // to ~255s — past the 60s default per-test timeout (playwright.config.ts):
+  // the SW taking control (30s), the warm map boot, caching every loaded asset
+  // (60s), and the offline cold boot that re-parses/executes the ~13 MB MapLibre
+  // chunk from cache under software WebGL (60s + 60s). None of these is a fixed
+  // cost — each returns as soon as its condition is met — but the per-assertion
+  // budgets are deliberately generous, so the test-level cap (plus the untimed
+  // goto/networkidle/reload navigations that inherit it) must be larger than
+  // their sum for those budgets, rather than the cap, to govern. See issue #274.
+  test.setTimeout(360_000);
+
+  // waitForLoadedAssetsCached() below enumerates the assets the boot pulled in
+  // from performance.getEntriesByType("resource"), whose buffer defaults to 250
+  // entries. The warm boot loads ~285 same-origin assets, so the *earliest*
+  // chunks (the entry, React, and the runtime-cached MapLibre chunk the offline
+  // boot depends on) get evicted from the buffer and silently skipped by the
+  // cache check — letting the test go offline before they are durably cached.
+  // Enlarge the buffer before any resource loads so every asset is verified.
+  await page.addInitScript(() => {
+    performance.setResourceTimingBufferSize(1000);
+  });
+
   await page.goto("/");
 
   // The service worker activates and (via clientsClaim) takes control of the
@@ -68,7 +90,7 @@ test("registers a service worker and serves the shell offline after first visit"
   // uncached, so the offline reload can't import it and never renders the map.
   // Wait for all first-load requests to finish, then for every same-origin
   // build asset the boot pulled in to be durably present in Cache Storage.
-  await page.waitForLoadState("networkidle");
+  await page.waitForLoadState("networkidle", { timeout: 60_000 });
   await waitForLoadedAssetsCached(page);
 
   // Drop the network and reload: the precached shell plus the runtime-cached
