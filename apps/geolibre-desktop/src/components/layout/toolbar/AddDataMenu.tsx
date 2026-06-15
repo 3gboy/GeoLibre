@@ -8,8 +8,10 @@ import {
   DropdownMenuTrigger,
 } from "@geolibre/ui";
 import { Database } from "lucide-react";
+import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import type { AddDataKind } from "../AddDataDialog";
+import { isMobile } from "../../../lib/is-mobile";
 import type { AddLayerHandlers, ToolbarChrome } from "./constants";
 
 interface AddDataMenuProps {
@@ -31,6 +33,10 @@ export function AddDataMenu({
   onOpenOsmPbfDialog,
 }: AddDataMenuProps) {
   const { t } = useTranslation();
+  // PostgreSQL layers are served through the Martin tile server, a local helper
+  // binary with no Android build, so hide the source on mobile.
+  // The user agent is stable for the session, so evaluate once.
+  const mobile = useMemo(() => isMobile(), []);
 
   return (
     <DropdownMenu>
@@ -139,9 +145,11 @@ export function AddDataMenu({
         <DropdownMenuItem onSelect={addLayer.duckdb}>
           {t("toolbar.item.duckdbLayer")}
         </DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => onSetAddDataKind("postgres")}>
-          {t("toolbar.layerType.postgres")}
-        </DropdownMenuItem>
+        {!mobile && (
+          <DropdownMenuItem onSelect={() => onSetAddDataKind("postgres")}>
+            {t("toolbar.layerType.postgres")}
+          </DropdownMenuItem>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   );

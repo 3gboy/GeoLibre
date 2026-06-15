@@ -23,7 +23,7 @@ import {
 import {
   type CSSProperties,
   type DragEvent,
-  type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
   lazy,
   Suspense,
   useCallback,
@@ -305,6 +305,10 @@ export function DesktopShell({
 }: DesktopShellProps) {
   const shellRef = useRef<HTMLDivElement>(null);
   const verticalResizeGuideRef = useRef<HTMLDivElement>(null);
+  // Teardown for an in-progress panel resize, so a pointercancel or an unmount
+  // mid-drag still detaches the global listeners and restores document.body.
+  const activeResizeCleanupRef = useRef<(() => void) | null>(null);
+  useEffect(() => () => activeResizeCleanupRef.current?.(), []);
   const mapControllerRef = useRef<MapController | null>(null);
   const dragDepthRef = useRef(0);
   const dropMessageTimeoutRef = useRef<number | null>(null);
@@ -878,9 +882,12 @@ export function DesktopShell({
   );
 
   const startLayerPanelResize = useCallback(
-    (event: ReactMouseEvent<HTMLDivElement>) => {
+    (event: ReactPointerEvent<HTMLDivElement>) => {
       event.preventDefault();
       event.stopPropagation();
+      // Route all pointer events for this drag to the handle, so a touch that
+      // slides off it (or off-screen) still reaches the listeners below.
+      event.currentTarget.setPointerCapture?.(event.pointerId);
 
       const startX = event.clientX;
       const startWidth = layerPanelWidth;
@@ -894,7 +901,7 @@ export function DesktopShell({
       document.body.style.userSelect = "none";
       window.dispatchEvent(new Event(PANEL_RESIZE_START_EVENT));
 
-      const onMouseMove = (moveEvent: MouseEvent) => {
+      const onPointerMove = (moveEvent: PointerEvent) => {
         nextWidth = clamp(
           startWidth + moveEvent.clientX - startX,
           MIN_SIDE_PANEL_WIDTH,
@@ -919,9 +926,11 @@ export function DesktopShell({
         });
       };
 
-      const onMouseUp = () => {
-        window.removeEventListener("mousemove", onMouseMove);
-        window.removeEventListener("mouseup", onMouseUp);
+      const onPointerUp = () => {
+        window.removeEventListener("pointermove", onPointerMove);
+        window.removeEventListener("pointerup", onPointerUp);
+        window.removeEventListener("pointercancel", onPointerUp);
+        activeResizeCleanupRef.current = null;
         if (resizeFrame !== null) {
           window.cancelAnimationFrame(resizeFrame);
           resizeFrame = null;
@@ -937,16 +946,23 @@ export function DesktopShell({
         document.body.style.userSelect = previousUserSelect;
       };
 
-      window.addEventListener("mousemove", onMouseMove);
-      window.addEventListener("mouseup", onMouseUp);
+      // pointercancel fires when the gesture is interrupted (OS scroll, app
+      // backgrounded); run the same teardown so styles/listeners don't stick.
+      activeResizeCleanupRef.current = onPointerUp;
+      window.addEventListener("pointermove", onPointerMove);
+      window.addEventListener("pointerup", onPointerUp);
+      window.addEventListener("pointercancel", onPointerUp);
     },
     [deferPanelResize, layerPanelWidth],
   );
 
   const startStylePanelResize = useCallback(
-    (event: ReactMouseEvent<HTMLDivElement>) => {
+    (event: ReactPointerEvent<HTMLDivElement>) => {
       event.preventDefault();
       event.stopPropagation();
+      // Route all pointer events for this drag to the handle, so a touch that
+      // slides off it (or off-screen) still reaches the listeners below.
+      event.currentTarget.setPointerCapture?.(event.pointerId);
 
       const startX = event.clientX;
       const startWidth = stylePanelWidth;
@@ -960,7 +976,7 @@ export function DesktopShell({
       document.body.style.userSelect = "none";
       window.dispatchEvent(new Event(PANEL_RESIZE_START_EVENT));
 
-      const onMouseMove = (moveEvent: MouseEvent) => {
+      const onPointerMove = (moveEvent: PointerEvent) => {
         nextWidth = clamp(
           startWidth + startX - moveEvent.clientX,
           MIN_SIDE_PANEL_WIDTH,
@@ -985,9 +1001,11 @@ export function DesktopShell({
         });
       };
 
-      const onMouseUp = () => {
-        window.removeEventListener("mousemove", onMouseMove);
-        window.removeEventListener("mouseup", onMouseUp);
+      const onPointerUp = () => {
+        window.removeEventListener("pointermove", onPointerMove);
+        window.removeEventListener("pointerup", onPointerUp);
+        window.removeEventListener("pointercancel", onPointerUp);
+        activeResizeCleanupRef.current = null;
         if (resizeFrame !== null) {
           window.cancelAnimationFrame(resizeFrame);
           resizeFrame = null;
@@ -1003,8 +1021,12 @@ export function DesktopShell({
         document.body.style.userSelect = previousUserSelect;
       };
 
-      window.addEventListener("mousemove", onMouseMove);
-      window.addEventListener("mouseup", onMouseUp);
+      // pointercancel fires when the gesture is interrupted (OS scroll, app
+      // backgrounded); run the same teardown so styles/listeners don't stick.
+      activeResizeCleanupRef.current = onPointerUp;
+      window.addEventListener("pointermove", onPointerMove);
+      window.addEventListener("pointerup", onPointerUp);
+      window.addEventListener("pointercancel", onPointerUp);
     },
     [deferPanelResize, stylePanelWidth],
   );
@@ -1033,7 +1055,7 @@ export function DesktopShell({
           />
         </SectionErrorBoundary>
       ) : null}
-      <div className="flex min-h-0 flex-1 flex-col md:flex-row">
+      <div className="relative flex min-h-0 flex-1 flex-col md:flex-row">
         {layoutOptions.layerPanelVisible ? (
           <SectionErrorBoundary label="Layer panel">
             <LayerPanel
