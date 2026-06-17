@@ -16,7 +16,9 @@ import type {
 let basemapControlPosition: GeoLibreMapControlPosition = "top-left";
 
 let basemapControl: BasemapControl | null = null;
-let registeredRasterLayerId: string | null = null;
+// GeoLibre layer ids of registered raster basemaps, keyed by basemap id. In
+// multiple mode several raster basemaps can be registered at once.
+const registeredRasterLayers = new Map<string, string>();
 
 export const maplibreBasemapControlPlugin: GeoLibrePlugin = {
   id: "maplibre-gl-basemap-control",
@@ -27,6 +29,9 @@ export const maplibreBasemapControlPlugin: GeoLibrePlugin = {
       basemapControl = new BasemapControl(getBasemapControlOptions(app));
       basemapControl.on("basemapchange", (event) => {
         handleBasemapChange(app, event);
+      });
+      basemapControl.on("basemapremove", (event) => {
+        handleBasemapRemove(app, event);
       });
     }
 
@@ -41,15 +46,15 @@ export const maplibreBasemapControlPlugin: GeoLibrePlugin = {
     basemapControl.setState({
       activeBasemapId: getBasemapIdForStyleUrl(app.getActiveBasemap()),
     });
-    // Re-link a raster basemap layer restored from a reopened project so that a
-    // later switch to a style basemap can unregister it (the module state does
-    // not survive a new session).
-    relinkRestoredRasterBasemap();
+    // Re-link raster basemap layers restored from a reopened project so that a
+    // later switch to a style basemap or a removal can unregister them (the
+    // module state does not survive a new session).
+    relinkRestoredRasterBasemaps();
     setTimeout(() => basemapControl?.expand(), 0);
   },
   deactivate: (app: GeoLibreAppAPI) => {
     if (!basemapControl) return;
-    unregisterActiveRasterBasemap(app);
+    unregisterAllRasterBasemaps(app);
     app.removeMapControl(basemapControl);
     basemapControl = null;
   },
@@ -84,18 +89,32 @@ function handleBasemapChange(
   app: GeoLibreAppAPI,
   event: BasemapControlEventPayload,
 ): void {
+  // Narrows the BasemapControlEventPayload union so event.basemap is accessible.
   if (event.type !== "basemapchange") return;
   const { source } = event.basemap;
   if (source.type === "raster") {
     registerRasterBasemap(app, event.basemap, event);
     return;
   }
-  // Any non-raster basemap (including an unrecognized future source type)
-  // clears a previously registered raster layer so it does not linger in the
-  // layer manager.
-  unregisterActiveRasterBasemap(app);
+  // Only a style/vector-style basemap actually replaces the whole map style
+  // (and so drops every managed raster overlay). Bail out on any other type
+  // before touching the layer manager, so an unrecognized future source type
+  // does not evict the raster overlays without replacing the style.
   if (source.type !== "style" && source.type !== "vector-style") return;
+  unregisterAllRasterBasemaps(app);
   app.setBasemap(source.url);
+}
+
+function handleBasemapRemove(
+  app: GeoLibreAppAPI,
+  event: BasemapControlEventPayload,
+): void {
+  // Narrows the BasemapControlEventPayload union so event.basemap is accessible.
+  if (event.type !== "basemapremove") return;
+  const layerId = registeredRasterLayers.get(event.basemap.id);
+  if (!layerId) return;
+  app.unregisterExternalNativeLayer?.(layerId);
+  registeredRasterLayers.delete(event.basemap.id);
 }
 
 function registerRasterBasemap(
@@ -108,8 +127,14 @@ function registerRasterBasemap(
   if (!managedRaster || !app.registerExternalNativeLayer) return;
 
   const layerId = `basemap-${basemap.id}`;
-  if (registeredRasterLayerId && registeredRasterLayerId !== layerId) {
-    app.unregisterExternalNativeLayer?.(registeredRasterLayerId);
+  // In replace mode the control keeps a single raster basemap, so drop any
+  // other registered raster basemaps. In add mode they stack, so keep them; if
+  // this basemap is already registered (a duplicate add event), there is
+  // nothing to do.
+  if (event.mode !== "add") {
+    unregisterRasterBasemapsExcept(app, basemap.id);
+  } else if (registeredRasterLayers.has(basemap.id)) {
+    return;
   }
 
   app.registerExternalNativeLayer({
@@ -144,23 +169,46 @@ function registerRasterBasemap(
         basemap.source.tiles.length > 0 ? basemap.source.tiles[0] : undefined,
     },
   });
-  registeredRasterLayerId = layerId;
+  registeredRasterLayers.set(basemap.id, layerId);
 }
 
-function unregisterActiveRasterBasemap(app: GeoLibreAppAPI): void {
-  if (!registeredRasterLayerId) return;
-  app.unregisterExternalNativeLayer?.(registeredRasterLayerId);
-  registeredRasterLayerId = null;
+function unregisterAllRasterBasemaps(app: GeoLibreAppAPI): void {
+  for (const layerId of registeredRasterLayers.values()) {
+    app.unregisterExternalNativeLayer?.(layerId);
+  }
+  registeredRasterLayers.clear();
 }
 
-function relinkRestoredRasterBasemap(): void {
-  if (registeredRasterLayerId) return;
+function unregisterRasterBasemapsExcept(
+  app: GeoLibreAppAPI,
+  keepBasemapId: string,
+): void {
+  // Snapshot the entries so deleting from the Map mid-loop is safe.
+  for (const [basemapId, layerId] of [...registeredRasterLayers.entries()]) {
+    if (basemapId === keepBasemapId) continue;
+    app.unregisterExternalNativeLayer?.(layerId);
+    registeredRasterLayers.delete(basemapId);
+  }
+}
+
+function relinkRestoredRasterBasemaps(): void {
+  if (registeredRasterLayers.size > 0) return;
   const restored = useAppStore
     .getState()
-    .layers.find(
+    .layers.filter(
       (layer) => layer.metadata?.sourceKind === "maplibre-basemap-control",
     );
-  if (restored) registeredRasterLayerId = restored.id;
+  for (const layer of restored) {
+    const basemapId = layer.metadata?.basemapId;
+    if (typeof basemapId === "string") {
+      registeredRasterLayers.set(basemapId, layer.id);
+    } else if (layer.id.startsWith("basemap-")) {
+      // Fallback for projects saved before basemapId was stored in metadata.
+      // The layer id is deterministic (`basemap-${basemap.id}`), so the
+      // original basemap id can be recovered by stripping the prefix.
+      registeredRasterLayers.set(layer.id.slice("basemap-".length), layer.id);
+    }
+  }
 }
 
 function getManagedRaster(
