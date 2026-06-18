@@ -254,6 +254,19 @@ function syncExternalNativeLayer(
     return;
   }
 
+  // Generic external raster tiles registered by third-party plugins (e.g. a
+  // titiler-served XYZ source) carry no recognized sourceKind, so they match
+  // none of the handlers above. Honor the documented external-layer contract
+  // (a `source` with `tiles` and `type: "raster"`) by building the source and
+  // raster layer here instead of dropping through to the GeoJSON path below.
+  // IMPORTANT: this is a structural catch-all, so add any new named raster
+  // handler (new sourceKind) BEFORE this check — placing it after would let a
+  // layer that also has `source.tiles` be intercepted by the generic path.
+  if (isExternalRasterTileLayer(layer)) {
+    syncExternalRasterTileLayer(map, layer, nativeLayerIds, beforeId);
+    return;
+  }
+
   ensureExternalGeoJsonNativeLayer(map, layer, nativeLayerIds, beforeId);
 
   const nativeFillLayerSpecs = nativeLayerIds
@@ -764,6 +777,73 @@ function isBasemapControlRasterLayer(layer: GeoLibreLayer): boolean {
   );
 }
 
+// A raster layer registered by a third-party plugin through
+// registerExternalNativeLayer that supplies its own XYZ tile template(s) in
+// `source.tiles`. Unlike the basemap/web-service/PMTiles raster paths above it
+// carries no GeoLibre-internal sourceKind, so it is matched structurally: any
+// external raster layer with concrete tiles and no dedicated handler.
+function isExternalRasterTileLayer(layer: GeoLibreLayer): boolean {
+  return (
+    layer.type === "raster" &&
+    layer.metadata.externalNativeLayer === true &&
+    getSourceTiles(layer).length > 0
+  );
+}
+
+// Build the MapLibre source and raster layer for a generic external raster tile
+// registration. Mirrors syncBasemapControlRasterLayer/syncWebServiceTileRasterLayer
+// but reads everything from the registration's own `source`, so any plugin that
+// hands GeoLibre an XYZ raster source renders without needing a bespoke handler.
+function syncExternalRasterTileLayer(
+  map: maplibregl.Map,
+  layer: GeoLibreLayer,
+  nativeLayerIds: string[],
+  beforeId?: string,
+): void {
+  const nativeLayerId = nativeLayerIds[0] ?? layer.id;
+  const sourceId = getExternalSourceIds(layer)[0] ?? `${nativeLayerId}-source`;
+  const tiles = getSourceTiles(layer);
+  if (tiles.length === 0) return;
+
+  // The source is built once and never rebuilt while it exists, matching the
+  // other raster handlers above. A plugin that re-registers the same sourceId
+  // with a different `tiles` array will keep serving the original tiles; to
+  // switch tile URLs it must register under a new sourceId.
+  if (!map.getSource(sourceId)) {
+    const bounds = boundsSource(layer.source.bounds);
+    map.addSource(sourceId, {
+      type: "raster",
+      tiles,
+      tileSize: numberSource(layer.source.tileSize) ?? 256,
+      ...(numberSource(layer.source.minzoom) !== undefined
+        ? { minzoom: numberSource(layer.source.minzoom) }
+        : {}),
+      ...(numberSource(layer.source.maxzoom) !== undefined
+        ? { maxzoom: numberSource(layer.source.maxzoom) }
+        : {}),
+      ...(bounds ? { bounds } : {}),
+      ...(layer.source.scheme === "tms" ? { scheme: "tms" as const } : {}),
+      ...(stringSource(layer.source.attribution)
+        ? { attribution: stringSource(layer.source.attribution) }
+        : {}),
+    });
+  }
+
+  ensureLayer(
+    map,
+    nativeLayerId,
+    {
+      id: nativeLayerId,
+      type: "raster",
+      source: sourceId,
+      ...styleLayerZoomRange(layer.style),
+      paint: rasterPaint(layer.style, layer.opacity),
+      layout: { visibility: layer.visible ? "visible" : "none" },
+    },
+    beforeId,
+  );
+}
+
 // Raster basemaps selected in the basemap control are normally rendered by the
 // control itself. Rebuilding them here too keeps them on the map after a style
 // reload (e.g. reopening a project), where the control does not replay them.
@@ -910,14 +990,24 @@ function boundsSource(
     : undefined;
 }
 
-function getBasemapControlTiles(layer: GeoLibreLayer): string[] {
+// Concrete XYZ tile templates from the registration's own `source.tiles`. This
+// is the documented external-raster contract and the only source the generic
+// external-raster path reads — it deliberately does not look at
+// metadata.tileUrl (see getBasemapControlTiles for that basemap-internal key).
+function getSourceTiles(layer: GeoLibreLayer): string[] {
   const tiles = layer.source.tiles;
-  if (Array.isArray(tiles)) {
-    const valid = tiles.filter(
-      (tile): tile is string => typeof tile === "string" && tile.length > 0,
-    );
-    if (valid.length > 0) return valid;
-  }
+  if (!Array.isArray(tiles)) return [];
+  return tiles.filter(
+    (tile): tile is string => typeof tile === "string" && tile.length > 0,
+  );
+}
+
+function getBasemapControlTiles(layer: GeoLibreLayer): string[] {
+  const tiles = getSourceTiles(layer);
+  if (tiles.length > 0) return tiles;
+  // The basemap control stores its single tile template under this internal
+  // metadata key rather than source.tiles; that fallback is specific to the
+  // basemap/web-service paths and intentionally not part of getSourceTiles.
   const tileUrl = stringMetadata(layer.metadata.tileUrl);
   return tileUrl ? [tileUrl] : [];
 }
