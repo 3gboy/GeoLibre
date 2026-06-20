@@ -816,6 +816,12 @@ export const MapCanvas = memo(function MapCanvas({
       return;
     }
 
+    // COG layers are identified by the raster control's pixel inspector (driven
+    // by useRasterIdentify in the desktop app), not this vector/WMS feature
+    // query. Bail so the two don't both register a map-click handler. (Only
+    // "cog" is identify-enabled; plain "raster" never reaches here.)
+    if (layer.type === "cog") return;
+
     map.getCanvas().style.cursor = "crosshair";
 
     let wmsIdentifyAbortController: AbortController | null = null;
