@@ -79,7 +79,8 @@
     "reset": "Reset",
     "remove": "Remove",
     "add": "Add",
-    "ok": "OK"
+    "ok": "OK",
+    "openWebApp": "Open the GeoLibre web app"
   },
   "addData": {
     "title": "Add Data",

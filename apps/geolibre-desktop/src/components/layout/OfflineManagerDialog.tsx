@@ -18,10 +18,10 @@ import {
   Pencil,
   RefreshCw,
   Trash2,
-  WifiOff,
   X,
 } from "lucide-react";
 import { hasActiveServiceWorker, warmUrls } from "../../lib/offline-tiles";
+import { NoServiceWorkerBanner } from "./NoServiceWorkerBanner";
 import {
   deleteOfflineRegion,
   formatBytes,
@@ -194,10 +194,7 @@ export function OfflineManagerDialog({
         </DialogHeader>
 
         {!swActive && (
-          <p className="flex items-start gap-2 rounded-md bg-amber-500/10 p-2 text-sm text-amber-700 dark:text-amber-400">
-            <WifiOff className="mt-0.5 h-4 w-4 shrink-0" />
-            {t("offlineManager.noServiceWorker")}
-          </p>
+          <NoServiceWorkerBanner message={t("offlineManager.noServiceWorker")} />
         )}
 
         {regions.length === 0 ? (

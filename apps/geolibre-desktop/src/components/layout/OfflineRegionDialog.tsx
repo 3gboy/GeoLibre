@@ -19,7 +19,6 @@ import {
   Download,
   Loader2,
   RotateCw,
-  WifiOff,
 } from "lucide-react";
 import {
   type Bbox,
@@ -29,6 +28,7 @@ import {
   warmUrls,
   type WarmProgress,
 } from "../../lib/offline-tiles";
+import { NoServiceWorkerBanner } from "./NoServiceWorkerBanner";
 import {
   describeBboxCenter,
   formatBytes,
@@ -318,6 +318,10 @@ export function OfflineRegionDialog({
   // After a partial download the primary action becomes "Retry all tiles" (a
   // full re-warm from scratch), shown alongside the targeted "Retry failed".
   const hasFailures = phase === "done" && progress.failed > 0;
+  // Gate every download control while a run is in flight, and also when there is
+  // no service worker to retain the tiles — without it the dialog would invite
+  // the user to configure a download this build can never persist (see #608).
+  const controlsDisabled = phase === "running" || !swActive;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -328,10 +332,7 @@ export function OfflineRegionDialog({
         </DialogHeader>
 
         {!swActive && (
-          <p className="flex items-start gap-2 rounded-md bg-amber-500/10 p-2 text-sm text-amber-700 dark:text-amber-400">
-            <WifiOff className="mt-0.5 h-4 w-4 shrink-0" />
-            {t("offline.noServiceWorker")}
-          </p>
+          <NoServiceWorkerBanner message={t("offline.noServiceWorker")} />
         )}
 
         {uncacheableHosts.length > 0 && (
@@ -353,7 +354,7 @@ export function OfflineRegionDialog({
               className="h-4 w-4"
               type="checkbox"
               checked={includeExtra}
-              disabled={phase === "running"}
+              disabled={controlsDisabled}
               onChange={(event) => setIncludeExtra(event.target.checked)}
             />
             {t("offline.includeExtra")}
@@ -378,7 +379,7 @@ export function OfflineRegionDialog({
                 step={1}
                 value={[extraLevels]}
                 onValueChange={(value: number[]) => setExtraLevels(value[0])}
-                disabled={phase === "running"}
+                disabled={controlsDisabled}
               />
             </div>
           ) : (
@@ -390,8 +391,9 @@ export function OfflineRegionDialog({
           <div className="space-y-3">
             <button
               type="button"
-              className="flex items-center gap-1 text-sm font-medium text-muted-foreground transition-colors hover:text-foreground"
+              className="flex items-center gap-1 text-sm font-medium text-muted-foreground transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:text-muted-foreground"
               aria-expanded={showAdvanced}
+              disabled={controlsDisabled}
               onClick={() => setShowAdvanced((value) => !value)}
             >
               {showAdvanced ? (
@@ -420,7 +422,7 @@ export function OfflineRegionDialog({
                     onValueChange={(value: number[]) =>
                       setConcurrency(value[0])
                     }
-                    disabled={phase === "running"}
+                    disabled={controlsDisabled}
                   />
                   <p className="text-xs text-muted-foreground">
                     {t("offline.concurrencyHint")}
@@ -437,7 +439,7 @@ export function OfflineRegionDialog({
                     min={0}
                     max={MAX_TIMEOUT_SEC}
                     value={timeoutSec}
-                    disabled={phase === "running"}
+                    disabled={controlsDisabled}
                     onChange={(event) => {
                       const next = Math.round(Number(event.target.value));
                       setTimeoutSec(
@@ -515,7 +517,15 @@ export function OfflineRegionDialog({
             </Button>
           )}
           {hasFailures && (
-            <Button variant="outline" onClick={handleRetry}>
+            <Button
+              variant="outline"
+              onClick={handleRetry}
+              // Mirrors the primary button's guard for consistency. In practice
+              // only the `phase === "running"` half bites here (this button
+              // renders only when phase is "done"), but reusing controlsDisabled
+              // keeps the gate correct if either condition later changes.
+              disabled={controlsDisabled}
+            >
               <RotateCw className="mr-2 h-4 w-4" />
               {t("offline.retryFailed", { count: progress.failed })}
             </Button>
@@ -525,7 +535,7 @@ export function OfflineRegionDialog({
             // handleDownload aborts any in-flight run first, so it is safe to
             // keep enabled even while failures are outstanding.
             onClick={handleDownload}
-            disabled={phase === "running" || tileCount === 0 || !swActive}
+            disabled={controlsDisabled || tileCount === 0}
           >
             {phase === "running" ? (
               <Loader2 className="mr-2 h-4 w-4 animate-spin" />
