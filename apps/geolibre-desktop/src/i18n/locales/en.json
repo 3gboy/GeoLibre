@@ -60,9 +60,11 @@
   },
   "newProject": {
     "basemapDescription": "Choose an OpenFreeMap or Protomaps basemap, a blank background, or a MapLibre style URL.",
+    "basemapDescriptionNoProtomaps": "Choose an OpenFreeMap basemap, a blank background, or a MapLibre style URL.",
     "sectionOpenFreeMap": "OpenFreeMap",
     "sectionProtomaps": "Protomaps",
-    "sectionOther": "Other"
+    "sectionOther": "Other",
+    "customUrlButton": "Custom URL"
   },
   "common": {
     "pickColorFromScreen": "Pick a color from the screen",
