@@ -1110,10 +1110,12 @@ export function LayerPanel({
                 <Pencil className="mr-2 h-3.5 w-3.5" />
                 {t("layers.renameGroup")}
               </DropdownMenuItem>
+              {/* Action items below omit preventDefault so Radix dismisses the
+                  menu on select; only the rename item above keeps it, so the
+                  menu's close does not race its input autofocus. */}
               <DropdownMenuItem
                 disabled={!canReorderGroup}
-                onSelect={(e: Event) => {
-                  e.preventDefault();
+                onSelect={() => {
                   reorderLayerGroup(group.id, "up");
                 }}
               >
@@ -1122,8 +1124,7 @@ export function LayerPanel({
               </DropdownMenuItem>
               <DropdownMenuItem
                 disabled={!canReorderGroup}
-                onSelect={(e: Event) => {
-                  e.preventDefault();
+                onSelect={() => {
                   reorderLayerGroup(group.id, "down");
                 }}
               >
@@ -1132,8 +1133,7 @@ export function LayerPanel({
               </DropdownMenuItem>
               <DropdownMenuSeparator />
               <DropdownMenuItem
-                onSelect={(e: Event) => {
-                  e.preventDefault();
+                onSelect={() => {
                   removeLayerGroup(group.id);
                 }}
               >
@@ -1142,8 +1142,7 @@ export function LayerPanel({
               </DropdownMenuItem>
               <DropdownMenuItem
                 className="text-destructive"
-                onSelect={(e: Event) => {
-                  e.preventDefault();
+                onSelect={() => {
                   removeLayerGroup(group.id, { removeChildren: true });
                 }}
               >
@@ -1612,9 +1611,13 @@ export function LayerPanel({
                         Rename
                       </DropdownMenuItem>
                       <DropdownMenuSeparator />
+                      {/* The Rename item above keeps preventDefault so the
+                          menu's close does not race its input autofocus. Every
+                          action item below has no such focus target, so each
+                          lets Radix dismiss the menu on select rather than
+                          leaving it pinned open. */}
                       <DropdownMenuItem
-                        onSelect={(e: Event) => {
-                          e.preventDefault();
+                        onSelect={() => {
                           addLayerGroup(undefined, [layer.id]);
                         }}
                       >
@@ -1632,8 +1635,7 @@ export function LayerPanel({
                               <DropdownMenuItem
                                 key={g.id}
                                 disabled={layer.groupId === g.id}
-                                onSelect={(e: Event) => {
-                                  e.preventDefault();
+                                onSelect={() => {
                                   moveLayerToGroup(layer.id, g.id);
                                 }}
                               >
@@ -1645,8 +1647,7 @@ export function LayerPanel({
                       )}
                       {layer.groupId && (
                         <DropdownMenuItem
-                          onSelect={(e: Event) => {
-                            e.preventDefault();
+                          onSelect={() => {
                             moveLayerToGroup(layer.id, null);
                           }}
                         >
@@ -1658,8 +1659,7 @@ export function LayerPanel({
                       {canMaterializeDuckDB && (
                         <>
                           <DropdownMenuItem
-                            onSelect={(e: Event) => {
-                              e.preventDefault();
+                            onSelect={() => {
                               onMaterializeDuckDBLayer(layer);
                             }}
                           >
@@ -1672,8 +1672,7 @@ export function LayerPanel({
                       {(canEditGeometry || geometryEditActive) && (
                         <DropdownMenuItem
                           disabled={geometryEditElsewhere}
-                          onSelect={(e: Event) => {
-                            e.preventDefault();
+                          onSelect={() => {
                             selectLayer(layer.id);
                             if (identifyActive) setIdentifyLayer(null);
                             onToggleGeometryEdit(layer.id);
@@ -1687,8 +1686,7 @@ export function LayerPanel({
                       )}
                       {canOpenAttributeTable && (
                         <DropdownMenuItem
-                          onSelect={(e: Event) => {
-                            e.preventDefault();
+                          onSelect={() => {
                             selectLayer(layer.id);
                             setAttributeTableOpen(true);
                           }}
@@ -1699,8 +1697,7 @@ export function LayerPanel({
                       )}
                       {canBindTimeSlider && (
                         <DropdownMenuItem
-                          onSelect={(e: Event) => {
-                            e.preventDefault();
+                          onSelect={() => {
                             if (timeBinding) {
                               handleUnbindTimeSlider(layer);
                             } else {
@@ -1722,40 +1719,35 @@ export function LayerPanel({
                           </DropdownMenuSubTrigger>
                           <DropdownMenuSubContent>
                             <DropdownMenuItem
-                              onSelect={(e: Event) => {
-                                e.preventDefault();
+                              onSelect={() => {
                                 void handleExportLayer(layer, "geojson");
                               }}
                             >
                               GeoJSON
                             </DropdownMenuItem>
                             <DropdownMenuItem
-                              onSelect={(e: Event) => {
-                                e.preventDefault();
+                              onSelect={() => {
                                 void handleExportLayer(layer, "geoparquet");
                               }}
                             >
                               GeoParquet
                             </DropdownMenuItem>
                             <DropdownMenuItem
-                              onSelect={(e: Event) => {
-                                e.preventDefault();
+                              onSelect={() => {
                                 void handleExportLayer(layer, "geopackage");
                               }}
                             >
                               GeoPackage
                             </DropdownMenuItem>
                             <DropdownMenuItem
-                              onSelect={(e: Event) => {
-                                e.preventDefault();
+                              onSelect={() => {
                                 void handleExportLayer(layer, "shapefile");
                               }}
                             >
                               Shapefile (zipped)
                             </DropdownMenuItem>
                             <DropdownMenuItem
-                              onSelect={(e: Event) => {
-                                e.preventDefault();
+                              onSelect={() => {
                                 void handleExportLayer(layer, "csv");
                               }}
                             >
@@ -1766,8 +1758,7 @@ export function LayerPanel({
                       )}
                       {canEditRasterStyle && (
                         <DropdownMenuItem
-                          onSelect={(e: Event) => {
-                            e.preventDefault();
+                          onSelect={() => {
                             selectLayer(layer.id);
                             onOpenRasterStylePanel();
                           }}
@@ -1784,8 +1775,7 @@ export function LayerPanel({
                           </DropdownMenuSubTrigger>
                           <DropdownMenuSubContent>
                             <DropdownMenuItem
-                              onSelect={(e: Event) => {
-                                e.preventDefault();
+                              onSelect={() => {
                                 void handleExportRasterLayer(layer);
                               }}
                             >
@@ -1796,8 +1786,7 @@ export function LayerPanel({
                       )}
                       <DropdownMenuItem
                         disabled={!canRefresh || isRefreshing}
-                        onSelect={(e: Event) => {
-                          e.preventDefault();
+                        onSelect={() => {
                           void handleRefreshLayer(layer);
                         }}
                       >
@@ -1810,8 +1799,7 @@ export function LayerPanel({
                       </DropdownMenuItem>
                       <DropdownMenuItem
                         disabled={!canRefresh}
-                        onSelect={(e: Event) => {
-                          e.preventDefault();
+                        onSelect={() => {
                           setRefreshSettingsLayerId(layer.id);
                         }}
                       >
