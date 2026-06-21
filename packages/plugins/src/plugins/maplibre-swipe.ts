@@ -104,12 +104,15 @@ function getSwipeControlOptions(
     collapsed: previousState?.collapsed ?? false,
     title: "Layer Swipe",
     panelWidth: 300,
-    maxHeight: 480,
+    // Upper bound only; the control also shrinks the panel to the available map height.
+    maxHeight: 900,
     active: previousState?.active ?? true,
     leftLayers: previousState?.leftLayers ?? [],
     rightLayers: previousState?.rightLayers ?? [],
+    // True only on first activation; restoring saved/project state keeps the user's selection.
+    selectVisibleByDefault: previousState === undefined,
     basemapStyle: app.getActiveBasemap(),
-    excludeLayers: ["gl-draw-*", "measure-*"],
+    excludeLayers: ["gl-draw-*", "measure-*", "geolibre-highlight-*"],
   };
 }
 
