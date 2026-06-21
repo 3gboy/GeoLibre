@@ -125,6 +125,7 @@ const NON_VECTOR_SIDECAR_EXTENSIONS = [
   "sbx",
   "qix",
   "qpj",
+  "cst",
   "aih",
   "ain",
   "atx",
@@ -545,6 +546,61 @@ async function openVectorFileTauri(
   return loadTauriVectorFile(selected, options);
 }
 
+/** A vector file picked from the desktop dialog, with any shapefile sidecars. */
+export interface PickedVectorFile {
+  /** The main vector file (the `.shp` for a shapefile). */
+  file: File;
+  /**
+   * Sidecar files for a shapefile (`.shx`, `.dbf`, `.prj`, `.cpg`) read from the
+   * same directory; empty for any other format.
+   */
+  companionFiles: File[];
+}
+
+/**
+ * Opens the native file dialog to pick one or more vector files and reads each
+ * into a browser `File`. For a `.shp`, its sidecar files in the same directory
+ * are read too, so a host with filesystem access can load a loose `.shp` without
+ * the user selecting every component. Sidecar files are skipped as standalone
+ * picks (they ride along with their `.shp` via `companionFiles`).
+ *
+ * Used by the Add Data > Vector panel on desktop, which feeds each result to the
+ * control's `addData(file, { companionFiles })`. Resolves to an empty array when
+ * the dialog is cancelled.
+ *
+ * @returns The picked vector files, each with its shapefile sidecars.
+ */
+export async function pickVectorFilesWithSidecars(): Promise<PickedVectorFile[]> {
+  const selected = await open({ multiple: true });
+  if (!selected) return [];
+  // `isVectorFileName` drops rasters, project files, and shapefile sidecars, so
+  // a sidecar picked on its own never becomes its own (unreadable) layer.
+  const paths = (Array.isArray(selected) ? selected : [selected]).filter(
+    isVectorFileName,
+  );
+  const picked: PickedVectorFile[] = [];
+  for (const path of paths) {
+    // Read each pick independently so one unreadable file (e.g. moved between
+    // pick and read, or an unreadable sidecar) does not abandon the rest.
+    try {
+      const file = new File(
+        [toArrayBuffer(await readFile(path))],
+        browserSafeFileName(path),
+      );
+      const companionFiles =
+        fileExtension(path) === "shp"
+          ? (await readShapefileSiblings(path)).map(
+              (sibling) => new File([toArrayBuffer(sibling.data)], sibling.name),
+            )
+          : [];
+      picked.push({ file, companionFiles });
+    } catch (error) {
+      console.warn(`Could not read the selected file "${path}".`, error);
+    }
+  }
+  return picked;
+}
+
 async function loadTauriVectorFile(
   path: string,
   options?: DuckDbVectorLoadOptions,
@@ -648,25 +704,21 @@ async function loadTauriVectorFile(
 async function readShapefileSiblings(
   path: string,
 ): Promise<DuckDbVectorFile[]> {
-  const basePath = pathWithoutExtension(path);
-  const siblings = await Promise.all(
-    SHAPEFILE_SIDECAR_EXTENSIONS.map(async (extension) => {
-      const siblingPath = `${basePath}.${extension}`;
-      try {
-        return {
-          name: browserSafeFileName(siblingPath),
-          extension,
-          data: await readFile(siblingPath),
-        };
-      } catch {
-        return null;
-      }
-    }),
+  // Read the sidecars through a Tauri command rather than the JS `fs` plugin:
+  // `fs` can only read paths the user explicitly picked or dropped, so a sidecar
+  // that was not selected (the whole point of auto-discovery) is forbidden. The
+  // command reads them directly and case-insensitively, returning each under the
+  // `.shp`'s base name with a lowercased extension. Returns [] off the desktop.
+  if (!isTauri()) return [];
+  const siblings = await invoke<Array<{ name: string; data: number[] }>>(
+    "read_shapefile_siblings",
+    { path },
   );
-
-  return siblings.filter(
-    (sibling): sibling is DuckDbVectorFile => sibling !== null,
-  );
+  return siblings.map((sibling) => ({
+    name: sibling.name,
+    extension: fileExtension(sibling.name),
+    data: new Uint8Array(sibling.data),
+  }));
 }
 
 async function openProjectFileBrowser(): Promise<{
