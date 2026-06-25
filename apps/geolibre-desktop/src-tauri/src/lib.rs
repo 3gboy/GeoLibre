@@ -181,6 +181,7 @@ pub fn run() {
             install_external_plugin_archive,
             load_external_plugin_bundles,
             read_admin_profile,
+            read_local_file,
             read_project_file,
             read_shapefile_siblings,
             resolve_url_redirect,
@@ -206,6 +207,111 @@ pub fn run() {
 #[tauri::command]
 fn read_project_file(path: String) -> Result<String, String> {
     fs::read_to_string(&path).map_err(|error| format!("Could not read project file: {error}"))
+}
+
+/// Local vector file extensions the restore path may re-read (lowercased, no
+/// dot). Mirrors `VECTOR_FILE_DIALOG_EXTENSIONS` in `tauri-io.ts`; keep the two
+/// in step.
+// SYNC: VECTOR_FILE_DIALOG_EXTENSIONS in src/lib/tauri-io.ts — grep "SYNC:" to
+// find the partner list and update both together.
+const RESTORABLE_VECTOR_EXTENSIONS: [&str; 17] = [
+    "geojson",
+    "json",
+    "gpkg",
+    "geoparquet",
+    "parquet",
+    "fgb",
+    "flatgeobuf",
+    "csv",
+    "tsv",
+    "kml",
+    "kmz",
+    "gml",
+    "gpx",
+    "dxf",
+    "tab",
+    "shp",
+    "zip",
+];
+
+/// Whether the renderer is permitted to re-read `path` through `read_local_file`:
+/// an absolute local path (POSIX `/...` or a Windows drive-letter `C:\...`, never
+/// a UNC `\\host\share`), free of `..` traversal segments, ending in a known
+/// vector extension.
+///
+/// This is a Rust-side backstop mirroring the frontend guard
+/// (`isAbsoluteLocalPath` + `hasPathTraversal` + `isRestorableVectorPath` in
+/// `tauri-io.ts`). It narrows the attack surface of a compromised webview or
+/// rogue plugin: arbitrary system files (`/etc/passwd`, SSH keys, most shell and
+/// app configs) are blocked. It does not make the command harmless — the
+/// allowlist still includes broad extensions like `json`, so a script that knows
+/// the path of a JSON-shaped secret could still read it — but it bounds reads to
+/// the vector formats the restore path actually needs. The checks are
+/// byte-oriented rather than `std::path` based so they behave identically for the
+/// Windows-style paths a project may carry regardless of the host the binary
+/// runs on.
+fn is_allowed_local_vector_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    let is_separator = |byte: u8| byte == b'/' || byte == b'\\';
+
+    // Reject UNC paths first. Both the Windows form ("\\server\share") and the
+    // forward-slash form ("//server/share") start with two separators and can
+    // make Windows auto-authenticate against a remote host, so neither may slip
+    // through the POSIX-absolute check below.
+    if bytes.len() >= 2 && is_separator(bytes[0]) && is_separator(bytes[1]) {
+        return false;
+    }
+
+    // Absolute local path only: POSIX "/..." or a Windows drive-letter "C:\..."
+    // / "C:/...".
+    let is_posix_absolute = bytes.first() == Some(&b'/');
+    let is_windows_drive = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && is_separator(bytes[2]);
+    if !is_posix_absolute && !is_windows_drive {
+        return false;
+    }
+
+    // Reject a "/../" or "\..\" traversal segment (but not a ".." inside a
+    // filename like "v1..2.gpkg"), matching `hasPathTraversal`.
+    if path.split(['/', '\\']).any(|segment| segment == "..") {
+        return false;
+    }
+
+    // Known vector extension, case-insensitive, matching the JS
+    // `RESTORABLE_VECTOR_PATH` regex (built from `VECTOR_FILE_DIALOG_EXTENSIONS`).
+    // `rsplit_once` takes the text after the final dot without allocating.
+    let lower = path.to_ascii_lowercase();
+    lower
+        .rsplit_once('.')
+        .is_some_and(|(_, extension)| RESTORABLE_VECTOR_EXTENSIONS.contains(&extension))
+}
+
+/// Read a local file's raw bytes so a project's file-referenced vector layers
+/// can be re-read when the project is reopened.
+///
+/// On reopen, a layer saved as a file reference carries only its absolute
+/// `sourcePath` (stored in the `.geolibre.json`); that path was never picked or
+/// dropped this session, so it sits outside the `fs` plugin's runtime scope and
+/// the JS `readFile`/`readTextFile` reject it. This reads the file directly,
+/// mirroring `read_project_file` (which bypasses the same scope to read the
+/// project file itself). The path is validated here by
+/// `is_allowed_local_vector_path` (absolute, no `..` traversal, known vector
+/// extension) so the command cannot be abused to read arbitrary files even if
+/// the frontend guard is bypassed. Bytes are returned as a raw IPC response (an
+/// `ArrayBuffer` on the JS side) so a large GeoJSON does not pay the cost of a
+/// JSON number array.
+#[tauri::command]
+fn read_local_file(path: String) -> Result<tauri::ipc::Response, String> {
+    if !is_allowed_local_vector_path(&path) {
+        return Err(format!(
+            "Refusing to read \"{path}\": not an absolute local vector file path"
+        ));
+    }
+    fs::read(&path)
+        .map(tauri::ipc::Response::new)
+        .map_err(|error| format!("Could not read local file: {error}"))
 }
 
 /// Shapefile sidecar extensions read alongside a `.shp` (lowercased, no dot).
@@ -431,7 +537,11 @@ fn plugin_archive_file_name(id: &str) -> String {
         })
         .collect();
     let trimmed = sanitized.trim_start_matches('.');
-    let safe = if trimmed.is_empty() { "plugin" } else { trimmed };
+    let safe = if trimmed.is_empty() {
+        "plugin"
+    } else {
+        trimmed
+    };
     format!("{safe}.zip")
 }
 
@@ -627,9 +737,7 @@ fn load_external_plugin_archive(
 /// root `plugin.json`, otherwise returns the shallowest `*/plugin.json`, ignoring
 /// the `__MACOSX/` metadata folder macOS adds to archives. Returns the manifest's
 /// full path within the archive, or None when no plugin.json is present.
-fn find_zip_manifest_path<R: Read + std::io::Seek>(
-    archive: &zip::ZipArchive<R>,
-) -> Option<String> {
+fn find_zip_manifest_path<R: Read + std::io::Seek>(archive: &zip::ZipArchive<R>) -> Option<String> {
     let names: Vec<&str> = archive.file_names().collect();
     if names.iter().any(|name| *name == "plugin.json") {
         return Some("plugin.json".to_string());
@@ -1209,9 +1317,7 @@ fn start_jupyter_server_blocking(app: tauri::AppHandle) -> Result<JupyterServerI
     let welcome_dest = notebooks_dir.join("Welcome.ipynb");
     if !welcome_dest.exists() {
         let _ = fs::copy(
-            project_dir
-                .join("notebook_examples")
-                .join("Welcome.ipynb"),
+            project_dir.join("notebook_examples").join("Welcome.ipynb"),
             &welcome_dest,
         );
     }
@@ -1654,8 +1760,7 @@ fn is_geolibre_jupyter_process(pid: i32) -> bool {
         return false;
     };
     let command_line = String::from_utf8_lossy(&command_line);
-    command_line.contains("jupyter_server_config.py")
-        && command_line.contains("geolibre_server")
+    command_line.contains("jupyter_server_config.py") && command_line.contains("geolibre_server")
 }
 
 #[cfg(unix)]
@@ -2382,13 +2487,47 @@ fn configure_linux_webkit() {}
 
 #[cfg(test)]
 mod tests {
-    use super::{find_zip_manifest_path, plugin_archive_file_name};
+    use super::{find_zip_manifest_path, is_allowed_local_vector_path, plugin_archive_file_name};
     use std::io::{Cursor, Write};
+
+    #[test]
+    fn allows_absolute_vector_paths() {
+        assert!(is_allowed_local_vector_path("/home/u/cities.geojson"));
+        assert!(is_allowed_local_vector_path(
+            "C:\\Users\\smith\\Mile_Markers.geojson"
+        ));
+        assert!(is_allowed_local_vector_path("C:/data/roads.gpkg"));
+        // Case-insensitive extension; a ".." inside the filename is fine.
+        assert!(is_allowed_local_vector_path("/data/v1..2.SHP"));
+    }
+
+    #[test]
+    fn rejects_non_vector_relative_or_traversal_paths() {
+        // Non-vector extension.
+        assert!(!is_allowed_local_vector_path("/etc/passwd"));
+        // Relative path.
+        assert!(!is_allowed_local_vector_path("cities.geojson"));
+        // Directory traversal segments.
+        assert!(!is_allowed_local_vector_path("/data/../etc/secret.geojson"));
+        assert!(!is_allowed_local_vector_path(
+            "C:\\data\\..\\secret.geojson"
+        ));
+        // UNC network paths, both the backslash and forward-slash forms.
+        assert!(!is_allowed_local_vector_path(
+            "\\\\server\\share\\x.geojson"
+        ));
+        assert!(!is_allowed_local_vector_path("//server/share/x.geojson"));
+        // Empty string is not an absolute path.
+        assert!(!is_allowed_local_vector_path(""));
+        // No extension, and a trailing dot (empty extension).
+        assert!(!is_allowed_local_vector_path("/home/user/noextension"));
+        assert!(!is_allowed_local_vector_path("/home/user/file."));
+    }
 
     fn zip_with_names(names: &[&str]) -> Vec<u8> {
         let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
-        let options =
-            zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
         for name in names {
             writer.start_file(*name, options).unwrap();
             writer.write_all(b"x").unwrap();

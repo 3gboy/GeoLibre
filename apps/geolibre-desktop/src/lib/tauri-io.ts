@@ -120,6 +120,10 @@ interface SaveTextFileOptions {
 interface SaveBinaryFileOptions extends SaveTextFileOptions {}
 
 const SHAPEFILE_SIDECAR_EXTENSIONS = ["dbf", "shx", "prj", "cpg"];
+// SYNC: RESTORABLE_VECTOR_EXTENSIONS in src-tauri/src/lib.rs must list the same
+// extensions, or a format added here would be rejected by the Rust restore
+// guard on every project reopen (the bug this PR fixes). Grep "SYNC:" to find
+// the partner list.
 const VECTOR_FILE_DIALOG_EXTENSIONS = [
   "geojson",
   "json",
@@ -279,6 +283,75 @@ function normalizeShapefileResult(value: unknown): FeatureCollection {
 
 async function parseGeoJsonText(text: string): Promise<FeatureCollection> {
   return assertFeatureCollection(JSON.parse(text));
+}
+
+/**
+ * Read a local file's bytes, falling back to the `read_local_file` Tauri command
+ * when the JS `fs` plugin denies the path.
+ *
+ * When a project is reopened, its file-referenced layer paths come from the
+ * saved `.geolibre.json` rather than from a picker or drag-drop, so they sit
+ * outside the `fs` plugin's runtime scope and `readFile` rejects them. The
+ * command reads the file directly, so a referenced layer reloads after a fresh
+ * launch instead of failing with a misleading "Could not convert this vector
+ * file with DuckDB-WASM" error.
+ *
+ * The fall-through is deliberately broad: it covers every `readFile` rejection,
+ * not just scope denials. The fs plugin does not expose a stable discriminant
+ * for an out-of-scope path (only a message we would have to substring-match, and
+ * a wrong guess would silently re-break the reload this fixes), so narrowing is
+ * not worth the fragility. The cost is one extra IPC round-trip on a genuine
+ * read failure (e.g. a moved file), where `read_local_file` fails too and its
+ * error surfaces instead of the plugin's. The command validates the path on the
+ * Rust side, so routing the read through it cannot widen what is readable.
+ *
+ * @param path - Absolute local path to read.
+ * @returns The file's raw bytes.
+ */
+async function readLocalFileBytes(
+  path: string,
+): Promise<Uint8Array<ArrayBuffer>> {
+  try {
+    return await readFile(path);
+  } catch (error) {
+    if (!isTauri()) throw error;
+    // Log the original fs-plugin error before retrying so a genuine read
+    // failure (a moved/deleted file, not a scope denial) is still diagnosable
+    // even though the command's "Could not read local file" error is what
+    // ultimately surfaces.
+    console.debug(
+      `[GeoLibre] fs read of "${path}" failed; retrying via read_local_file.`,
+      error,
+    );
+    const buffer = await invoke<ArrayBuffer>("read_local_file", { path });
+    return new Uint8Array(buffer);
+  }
+}
+
+/**
+ * Text counterpart to {@link readLocalFileBytes}: read a local file as UTF-8,
+ * falling back to the `read_local_file` Tauri command when the `fs` plugin
+ * denies the path (e.g. a project-referenced layer after a fresh launch). See
+ * {@link readLocalFileBytes} for why the fall-through catches every rejection.
+ *
+ * @param path - Absolute local path to read.
+ * @returns The file's decoded UTF-8 text.
+ */
+async function readLocalFileText(path: string): Promise<string> {
+  try {
+    return await readTextFile(path);
+  } catch (error) {
+    if (!isTauri()) throw error;
+    console.debug(
+      `[GeoLibre] fs read of "${path}" failed; retrying via read_local_file.`,
+      error,
+    );
+    const buffer = await invoke<ArrayBuffer>("read_local_file", { path });
+    // `fatal: true` matches `readTextFile`, which rejects on malformed UTF-8
+    // rather than silently substituting U+FFFD: a corrupt KML/GPX/GeoJSON
+    // should surface a clear read error, not parse as garbled-but-valid text.
+    return new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+  }
 }
 
 function parseGpxText(text: string): FeatureCollection {
@@ -685,8 +758,11 @@ export async function readVectorFileWithSidecars(
     return null;
   }
   try {
+    // Use the scope-tolerant reader: a project-reopened path was never picked
+    // or dropped this session, so the `fs` plugin scope rejects it and a raw
+    // `readFile` would throw — silently dropping the vector-control layer.
     const file = new File(
-      [toArrayBuffer(await readFile(path))],
+      [toArrayBuffer(await readLocalFileBytes(path))],
       browserSafeFileName(path),
     );
     const companionFiles =
@@ -723,7 +799,7 @@ async function loadTauriVectorFile(
   if (extension === "geojson" || extension === "json") {
     try {
       return {
-        data: await parseGeoJsonText(await readTextFile(path)),
+        data: await parseGeoJsonText(await readLocalFileText(path)),
         path,
       };
     } catch {
@@ -735,7 +811,7 @@ async function loadTauriVectorFile(
   if (extension === "zip") {
     try {
       return {
-        data: await parseShapefileZip(await readFile(path)),
+        data: await parseShapefileZip(await readLocalFileBytes(path)),
         path,
       };
     } catch {
@@ -746,7 +822,7 @@ async function loadTauriVectorFile(
   if (extension === "kmz") {
     try {
       return {
-        data: await parseKmz(await readFile(path), options),
+        data: await parseKmz(await readLocalFileBytes(path), options),
         path,
       };
     } catch (error) {
@@ -759,7 +835,7 @@ async function loadTauriVectorFile(
   if (extension === "kml") {
     try {
       return {
-        data: parseKmlText(await readTextFile(path)),
+        data: parseKmlText(await readLocalFileText(path)),
         path,
       };
     } catch {
@@ -770,7 +846,7 @@ async function loadTauriVectorFile(
   if (extension === "gpx") {
     try {
       return {
-        data: parseGpxText(await readTextFile(path)),
+        data: parseGpxText(await readLocalFileText(path)),
         path,
       };
     } catch (error) {
@@ -780,7 +856,7 @@ async function loadTauriVectorFile(
   }
 
   if (isDelimitedTextFileName(path)) {
-    const points = parseDelimitedTextFile(await readTextFile(path), path);
+    const points = parseDelimitedTextFile(await readLocalFileText(path), path);
     // No lon/lat columns: fall through to DuckDB so spatial CSV variants
     // (e.g. a WKT geometry column) still load.
     if (points) {
@@ -796,7 +872,7 @@ async function loadTauriVectorFile(
         {
           name: browserSafeFileName(path),
           extension,
-          data: await readFile(path),
+          data: await readLocalFileBytes(path),
           siblingFiles,
         },
         options,
@@ -1550,9 +1626,12 @@ export async function loadDroppedVectorPaths(
     if (SHAPEFILE_SIDECAR_EXTENSIONS.includes(extension)) continue;
     if (extension === "gpx") {
       try {
-        layers.push(...parseGpxTextLayers(await readTextFile(path), path));
+        layers.push(...parseGpxTextLayers(await readLocalFileText(path), path));
       } catch (error) {
-        const detail = error instanceof Error ? error.message : "Unknown error";
+        // `read_local_file` rejects with a plain string, not an `Error`, so
+        // fall back to `String(error)` to keep that detail instead of a generic
+        // "Unknown error" when the fs-plugin fallback fails.
+        const detail = error instanceof Error ? error.message : String(error);
         throw new Error(`Could not read this GPX file. ${detail}`);
       }
       continue;
