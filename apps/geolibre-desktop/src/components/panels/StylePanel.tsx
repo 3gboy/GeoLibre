@@ -2756,6 +2756,10 @@ export function StylePanel({
             id="fillColor"
             value={style.fillColor}
             onChange={(fillColor) => setLayerStyle(layer.id, { fillColor })}
+            allowTransparent
+            fallbackColor={DEFAULT_LAYER_STYLE.fillColor}
+            transparentLabel={t("style.symbology.transparent")}
+            transparentSwatchLabel={t("style.symbology.transparentSwatch")}
           />
         </div>
       ) : null}
@@ -2765,6 +2769,10 @@ export function StylePanel({
           id="strokeColor"
           value={style.strokeColor}
           onChange={(strokeColor) => setLayerStyle(layer.id, { strokeColor })}
+          allowTransparent
+          fallbackColor={DEFAULT_LAYER_STYLE.strokeColor}
+          transparentLabel={t("style.symbology.transparent")}
+          transparentSwatchLabel={t("style.symbology.transparentSwatch")}
         />
       </div>
       <NumericStyleInput
@@ -2996,8 +3004,10 @@ export function StylePanel({
             <PanelRightClose className="h-4 w-4" />
           </Button>
         </div>
-        <ScrollArea className="flex-1 p-3">
-          <div className="space-y-4">
+        <ScrollArea className="flex-1">
+          {/* Padding on the inner content with extra right clearance so the
+              overlay scrollbar never covers a control's right edge. */}
+          <div className="space-y-4 p-3 pr-5">
             {beforeIdControl}
             {zoomRangeControls}
             <RasterStyleSlider
@@ -3173,8 +3183,11 @@ export function StylePanel({
           <PanelRightClose className="h-4 w-4" />
         </Button>
       </div>
-      <ScrollArea className="flex-1 p-3">
-        <div className="space-y-4">
+      <ScrollArea className="flex-1">
+        {/* Padding lives on the inner content (not the ScrollArea root) with
+            extra right clearance so the overlay scrollbar never covers the
+            right edge of a control (e.g. the "Transparent" label). */}
+        <div className="space-y-4 p-3 pr-5">
           {beforeIdControl}
           {zoomRangeControls}
           {hasExtrusionControls && (
