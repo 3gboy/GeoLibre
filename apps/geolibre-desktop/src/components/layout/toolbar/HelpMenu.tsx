@@ -10,6 +10,8 @@ import {
 import {
   Bug,
   CircleHelp,
+  FolderGit2,
+  Globe,
   Info,
   Keyboard,
   MessageSquare,
@@ -19,7 +21,13 @@ import {
 import { useTranslation } from "react-i18next";
 import { useDesktopSettingsStore } from "../../../hooks/useDesktopSettings";
 import { isMenuItemVisible } from "../../../lib/ui-profile";
-import { FEEDBACK_URL, openExternalLink, type ToolbarChrome } from "./constants";
+import {
+  FEEDBACK_URL,
+  GITHUB_URL,
+  openExternalLink,
+  type ToolbarChrome,
+  WEBSITE_URL,
+} from "./constants";
 
 interface HelpMenuProps {
   chrome: ToolbarChrome;
@@ -76,6 +84,23 @@ export function HelpMenu({
         {(show("help.commandPalette") || show("help.keyboardShortcuts")) && (
           <DropdownMenuSeparator />
         )}
+        {show("help.website") && (
+          <DropdownMenuItem onSelect={() => void openExternalLink(WEBSITE_URL)}>
+            <Globe className="mr-2 h-3.5 w-3.5" />
+            {t("toolbar.command.website")}
+          </DropdownMenuItem>
+        )}
+        {show("help.github") && (
+          <DropdownMenuItem onSelect={() => void openExternalLink(GITHUB_URL)}>
+            <FolderGit2 className="mr-2 h-3.5 w-3.5" />
+            {t("toolbar.command.githubRepository")}
+          </DropdownMenuItem>
+        )}
+        {(show("help.website") || show("help.github")) &&
+          (show("help.diagnostics") ||
+            show("help.feedback") ||
+            show("help.checkForUpdates") ||
+            show("help.about")) && <DropdownMenuSeparator />}
         {show("help.diagnostics") && (
           <DropdownMenuItem onSelect={onOpenDiagnostics}>
             <Bug className="mr-2 h-3.5 w-3.5" />

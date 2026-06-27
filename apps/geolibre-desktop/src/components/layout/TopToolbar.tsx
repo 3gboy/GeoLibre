@@ -46,7 +46,9 @@ import {
   Users,
   FilePlus2,
   Folder,
+  FolderGit2,
   FolderOpen,
+  Globe,
   Info,
   Keyboard,
   Link2,
@@ -122,6 +124,7 @@ import {
   type AddLayerHandlers,
   CONVERSION_COMMANDS,
   FEEDBACK_URL,
+  GITHUB_URL,
   MAP_CONTROL_ITEMS,
   NEW_PROJECT_VISIBLE_BUILT_IN_CONTROLS,
   newProjectToolbarControlVisibility,
@@ -130,6 +133,7 @@ import {
   type ToolbarChrome,
   type ToolbarMapControl,
   VECTOR_TOOL_COMMANDS,
+  WEBSITE_URL,
 } from "./toolbar/constants";
 
 interface TopToolbarProps {
@@ -775,6 +779,22 @@ export function TopToolbar({
       keywords: "hotkeys cheat sheet",
       icon: Keyboard,
       run: () => setShortcutsOpen(true),
+    },
+    {
+      id: "help.website",
+      title: t("toolbar.command.website"),
+      group: t("toolbar.commandGroup.help"),
+      keywords: "home page site geolibre.app",
+      icon: Globe,
+      run: () => void openExternalLink(WEBSITE_URL),
+    },
+    {
+      id: "help.github",
+      title: t("toolbar.command.githubRepository"),
+      group: t("toolbar.commandGroup.help"),
+      keywords: "source code repo git opengeos",
+      icon: FolderGit2,
+      run: () => void openExternalLink(GITHUB_URL),
     },
     {
       id: "help.diagnostics",
