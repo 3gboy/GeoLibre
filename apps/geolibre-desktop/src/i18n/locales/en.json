@@ -232,7 +232,14 @@
       "urlPlaceholder": "https://example.com/geoserver/wms",
       "layers": "Layers",
       "styles": "Styles",
-      "transparent": "Transparent background"
+      "transparent": "Transparent background",
+      "retrieveLayers": "Retrieve layers",
+      "retrieving": "Retrieving...",
+      "retrievedLayers": "Retrieved layers",
+      "selectLayer_one": "Select from {{count}} layer",
+      "selectLayer_other": "Select from {{count}} layers",
+      "noLayersFound": "No layers were found for this service.",
+      "retrieveError": "Could not retrieve layers from this service."
     },
     "wfs": {
       "defaultName": "WFS Layer",
@@ -246,7 +253,14 @@
       "outputFormat": "Output format",
       "srsName": "SRS name",
       "maxFeatures": "Max features",
-      "errorMaxFeaturesNumeric": "Enter a numeric max features value."
+      "errorMaxFeaturesNumeric": "Enter a numeric max features value.",
+      "retrieveTypes": "Retrieve types",
+      "retrieving": "Retrieving...",
+      "retrievedTypes": "Retrieved feature types",
+      "selectType_one": "Select from {{count}} feature type",
+      "selectType_other": "Select from {{count}} feature types",
+      "noTypesFound": "No feature types were found for this service.",
+      "retrieveError": "Could not retrieve feature types from this service."
     },
     "wmts": {
       "defaultName": "WMTS Layer",
