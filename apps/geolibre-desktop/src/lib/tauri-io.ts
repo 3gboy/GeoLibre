@@ -212,6 +212,16 @@ export interface LoadedImageOverlay {
   bounds: [number, number, number, number];
   /** Overlay opacity in [0, 1]. */
   opacity: number;
+  /**
+   * Epoch-ms time bounds when the overlay is a `<TimeSpan>`/`<TimeStamp>` frame
+   * in a time-animated sequence. Set (with `groupId`/`visible`) by
+   * {@link sequenceTimeOverlays}; the Time Slider animates these frames.
+   */
+  timeSpan?: { begin: number | null; end: number | null };
+  /** Shared group id linking the frames of one animation. */
+  groupId?: string;
+  /** Initial visibility: only the first frame of a sequence starts visible. */
+  visible?: boolean;
 }
 
 /**
@@ -738,7 +748,65 @@ function imageOverlayLayer(
     coordinates: overlay.coordinates,
     bounds: overlay.bounds,
     opacity: overlay.opacity,
+    ...(overlay.time ? { timeSpan: overlay.time } : {}),
   };
+}
+
+/**
+ * Turn the time-tagged overlays in a set into an animation: sort them by start
+ * time, fill an open `<TimeStamp>`/`<TimeSpan>` end with the next frame's start
+ * (a step function), give them a shared group id, and leave only the first
+ * frame visible so the others do not all stack at once before the Time Slider
+ * is opened.
+ *
+ * Only overlays with a numeric start (`timeSpan.begin`) are treated as frames,
+ * matching what the Time Slider can animate; an overlay with an open-start span
+ * (or a lone time-tagged overlay that is not part of a sequence) has its
+ * transient `timeSpan` dropped so it stays a normal static overlay the slider
+ * never hides.
+ *
+ * @param overlays - The resolved overlays for one file, mutated in place.
+ * @returns The same array, for chaining.
+ */
+function sequenceTimeOverlays(
+  overlays: LoadedImageOverlay[],
+): LoadedImageOverlay[] {
+  const frames = overlays
+    .filter(
+      (overlay): overlay is LoadedImageOverlay & {
+        timeSpan: { begin: number; end: number | null };
+      } => typeof overlay.timeSpan?.begin === "number",
+    )
+    .sort((a, b) => a.timeSpan.begin - b.timeSpan.begin);
+
+  // An animation needs at least two frames with distinct start times. A lone
+  // time-tagged overlay, or several sharing one time (e.g. a single inherited
+  // Folder `<TimeSpan>`), is not a sequence; strip every transient timeSpan so
+  // the Time Slider treats these overlays as ordinary static layers.
+  const distinctBegins = new Set(frames.map((frame) => frame.timeSpan.begin));
+  if (distinctBegins.size < 2) {
+    for (const overlay of overlays) delete overlay.timeSpan;
+    return overlays;
+  }
+
+  const inSequence = new Set<LoadedImageOverlay>(frames);
+  const groupId = crypto.randomUUID();
+  frames.forEach((frame, index) => {
+    frame.groupId = groupId;
+    frame.visible = index === 0;
+    // A frame with an open end runs until the next frame begins (or stays open
+    // for the last frame), so an instant-tagged sequence steps cleanly.
+    if (frame.timeSpan.end === null) {
+      const next = frames[index + 1]?.timeSpan.begin;
+      if (typeof next === "number") frame.timeSpan.end = next;
+    }
+  });
+  // Any time-tagged overlay left out of the sequence (e.g. an open-start span)
+  // should not be animated, so drop its timeSpan too.
+  for (const overlay of overlays) {
+    if (!inSequence.has(overlay)) delete overlay.timeSpan;
+  }
+  return overlays;
 }
 
 // A ground-overlay image is inlined as a base64 `data:` URL on the layer and
@@ -815,7 +883,7 @@ async function groundOverlaysFromKmz(
     const url = await bytesToDataUrl(data, imageMimeFromName(overlay.href));
     overlays.push(imageOverlayLayer(overlay, url, path));
   }
-  return overlays;
+  return sequenceTimeOverlays(overlays);
 }
 
 // Browsers cannot decode TIFF into an <img>/canvas/createImageBitmap, which is
@@ -864,7 +932,7 @@ function groundOverlaysFromKml(
     }
     overlays.push(imageOverlayLayer(overlay, overlay.href.trim(), path));
   }
-  return overlays;
+  return sequenceTimeOverlays(overlays);
 }
 
 // A KML `<Model>` GLB is inlined as a base64 `data:` URL on the layer (textures

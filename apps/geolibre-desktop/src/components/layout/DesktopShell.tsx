@@ -29,6 +29,7 @@ import {
   setViewStateLabels,
   startLayerGeometryEdit,
   subscribeGeometryEdit,
+  TIME_SLIDER_PLUGIN_ID,
 } from "@geolibre/plugins";
 import { convertGeoTiffToCog, isTiff, readGeoTiffInfo } from "@geolibre/processing";
 import {
@@ -79,6 +80,7 @@ import {
   createAppAPI,
   getPluginManager,
   useExternalPluginsReady,
+  usePluginRegistry,
   useProjectPluginTrust,
   useSwipeSplitViewExclusivity,
 } from "../../hooks/usePlugins";
@@ -477,6 +479,9 @@ export function DesktopShell({
   const togglingGeometryEditRef = useRef(false);
   const addGeoJsonLayer = useAppStore((s) => s.addGeoJsonLayer);
   const addImageOverlayLayer = useAppStore((s) => s.addImageOverlayLayer);
+  const addLayerGroup = useAppStore((s) => s.addLayerGroup);
+  const { isActive: isPluginActive, toggle: togglePlugin } =
+    usePluginRegistry();
   const addLayer = useAppStore((s) => s.addLayer);
   const projectGeneration = useAppStore((s) => s.projectGeneration);
   const pythonConsoleOpen = useAppStore((s) => s.ui.pythonConsoleOpen);
@@ -988,6 +993,9 @@ export function DesktopShell({
   const addImportedVectorLayers = useCallback(
     (importedLayers: ImportedVectorLayer[]) => {
       let lastLayerId: string | null = null;
+      // Frame ids for each time-animated overlay sequence (keyed by the loader's
+      // group marker), so they can be gathered into one layer group afterward.
+      const frameGroups = new Map<string, string[]>();
       for (const layer of importedLayers) {
         // A KML/KMZ ground overlay becomes an image layer, not a vector one.
         if (isLoadedImageOverlay(layer)) {
@@ -1000,8 +1008,15 @@ export function DesktopShell({
               opacity: layer.opacity,
               bounds: layer.bounds,
               sourcePath: layer.path,
+              ...(layer.timeSpan ? { timeSpan: layer.timeSpan } : {}),
+              ...(layer.visible === false ? { visible: false } : {}),
             },
           );
+          if (layer.groupId) {
+            const ids = frameGroups.get(layer.groupId) ?? [];
+            ids.push(lastLayerId);
+            frameGroups.set(layer.groupId, ids);
+          }
           continue;
         }
         // A KML/KMZ <Model> becomes a deck.gl scenegraph layer.
@@ -1018,6 +1033,25 @@ export function DesktopShell({
           layer.data,
           layer.path,
         );
+      }
+
+      // Gather each time-animated overlay's frames into one collapsible group so
+      // the sequence reads as a single timeline entry, not N stacked layers.
+      const sequences = [...frameGroups.values()].filter((ids) => ids.length > 1);
+      sequences.forEach((ids, index) => {
+        // Suffix when a single drop yields more than one sequence so the groups
+        // are distinguishable in the panel (e.g. two independent radar loops).
+        const name =
+          sequences.length > 1
+            ? `${t("kml.timeOverlayGroup")} ${index + 1}`
+            : t("kml.timeOverlayGroup");
+        addLayerGroup(name, ids);
+      });
+      const hasTimeAnimation = sequences.length > 0;
+      // Auto-open the Time Slider so a time-animated overlay sequence can be
+      // stepped through immediately, without the user hunting for the plugin.
+      if (hasTimeAnimation && !isPluginActive(TIME_SLIDER_PLUGIN_ID)) {
+        togglePlugin(TIME_SLIDER_PLUGIN_ID, createAppAPI(mapControllerRef));
       }
 
       const importedLayer = useAppStore
@@ -1045,7 +1079,15 @@ export function DesktopShell({
         }
       }
     },
-    [addGeoJsonLayer, addImageOverlayLayer, addLayer],
+    [
+      addGeoJsonLayer,
+      addImageOverlayLayer,
+      addLayer,
+      addLayerGroup,
+      isPluginActive,
+      togglePlugin,
+      t,
+    ],
   );
 
   const addDroppedPhotos = useCallback(
