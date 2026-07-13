@@ -6,13 +6,21 @@ import { Search } from "lucide-react";
 import { useCallback, useMemo, useRef, useState, type RefObject } from "react";
 import { useTranslation } from "react-i18next";
 import { startGeoLibreSidecar } from "../../lib/sidecar";
-import { isTauri } from "../../lib/tauri-io";
+import {
+  isLoadableFilePath,
+  isTauri,
+  listDirectory,
+  pickLocalDirectory,
+} from "../../lib/tauri-io";
+import { pinFolder, unpinFolder } from "../../lib/browser-folders";
 import { useBrowserTree } from "../../hooks/useBrowserTree";
 import {
   augmentConnections,
+  augmentFolders,
   filterBrowserTree,
   type BrowserNode,
   type ConnectionLoad,
+  type FolderLoad,
 } from "../../lib/browser-tree";
 import { applyServiceEntry } from "../layout/add-data/apply-service";
 import { errorMessage } from "../layout/add-data/helpers";
@@ -20,8 +28,9 @@ import type { AddDataKind } from "../layout/AddDataDialog";
 import { openAddData } from "../layout/add-data/open-add-data";
 import { BrowserTreeNode } from "./BrowserTreeNode";
 
-/** The `connection:` id prefix a connection node carries (id = prefix + connString). */
+/** The `connection:` / `folder:` id prefixes (id = prefix + connString/path). */
 const CONNECTION_ID_PREFIX = "connection:";
+const FOLDER_ID_PREFIX = "folder:";
 
 interface BrowserPanelProps {
   mapControllerRef: RefObject<MapController | null>;
@@ -30,6 +39,13 @@ interface BrowserPanelProps {
    * Resolves to an error message to show inline, or null on success.
    */
   onOpenRecentProject: (path: string) => Promise<string | null>;
+  /**
+   * Add a local file (by absolute path) as a layer — vector/raster/MBTiles,
+   * dispatched by the shell which owns the store add-paths. Resolves to an error
+   * message to show inline, or null on success. Absent off-desktop (no Files
+   * section renders there).
+   */
+  onAddFilePath?: (path: string) => Promise<string | null>;
 }
 
 /** The section nodes are expanded by default so their contents are visible. */
@@ -37,6 +53,7 @@ const DEFAULT_EXPANDED = new Set([
   "section:services",
   "section:recent",
   "section:databases",
+  "section:files",
 ]);
 
 /** Collects every group node id in a tree (used to expand-all while searching). */
@@ -64,6 +81,7 @@ function collectGroupIds(nodes: readonly BrowserNode[], into: Set<string>): void
 export function BrowserPanel({
   mapControllerRef,
   onOpenRecentProject,
+  onAddFilePath,
 }: BrowserPanelProps) {
   const { t } = useTranslation();
   const addLayer = useAppStore((s) => s.addLayer);
@@ -176,15 +194,68 @@ export function BrowserPanel({
     [t],
   );
 
+  // Lazy directory listing for the Files section: keyed by absolute path,
+  // populated the first time a folder is expanded (same pattern as connections).
+  const [folderLoads, setFolderLoads] = useState<Record<string, FolderLoad>>(
+    {},
+  );
+  const folderFetchedRef = useRef<Set<string>>(new Set());
+  // Per-path fetch generation: bumped when a folder is (re)fetched or unpinned,
+  // so a slow listDirectory that resolves after the folder was unpinned/re-pinned
+  // can't clobber newer state with its stale result.
+  const folderGenRef = useRef<Map<string, number>>(new Map());
+
+  const fetchFolder = useCallback(
+    (path: string) => {
+      if (folderFetchedRef.current.has(path)) return;
+      folderFetchedRef.current.add(path);
+      const generation = (folderGenRef.current.get(path) ?? 0) + 1;
+      folderGenRef.current.set(path, generation);
+      const isCurrent = () => folderGenRef.current.get(path) === generation;
+      setFolderLoads((prev) => ({ ...prev, [path]: { status: "loading" } }));
+      listDirectory(path)
+        .then((entries) => {
+          if (!isCurrent()) return; // superseded by an unpin/re-pin mid-fetch
+          setFolderLoads((prev) => ({
+            ...prev,
+            [path]: { status: "loaded", entries },
+          }));
+        })
+        .catch((err: unknown) => {
+          if (!isCurrent()) return;
+          // Drop the marker so a re-expand retries (a folder can also change on
+          // disk); surface the message inline via the status row, using the
+          // translated fallback helper like fetchConnectionTables does.
+          folderFetchedRef.current.delete(path);
+          setFolderLoads((prev) => ({
+            ...prev,
+            [path]: {
+              status: "error",
+              message: errorMessage(err, t("browser.loadFolderFailed")),
+            },
+          }));
+        });
+    },
+    [t],
+  );
+
   // Inject each connection node's lazily-loaded children (loading/error status
   // rows, or schema→table nodes) before filtering. Search therefore reaches the
   // tables of connections the user has already expanded; an unexpanded
   // connection keeps its empty child list, so its tables aren't searchable
-  // until it is first drilled into.
+  // until it is first drilled into. Folder listings are injected the same way.
   const loadingLabel = t("browser.loadingTables");
+  const foldersLoadingLabel = t("browser.loadingFolder");
   const augmented = useMemo(
-    () => augmentConnections(tree, connLoads, loadingLabel),
-    [tree, connLoads, loadingLabel],
+    () =>
+      augmentFolders(
+        augmentConnections(tree, connLoads, loadingLabel),
+        folderLoads,
+        foldersLoadingLabel,
+        isLoadableFilePath,
+        (shown, total) => t("browser.folderTruncated", { shown, total }),
+      ),
+    [tree, connLoads, loadingLabel, folderLoads, foldersLoadingLabel, t],
   );
 
   const filtered = useMemo(
@@ -202,9 +273,12 @@ export function BrowserPanel({
   }, [query, expanded, filtered]);
 
   const toggle = (id: string) => {
-    // Kick off introspection the first time a connection is expanded.
+    // Kick off introspection/listing the first time a connection or folder is
+    // expanded.
     if (id.startsWith(CONNECTION_ID_PREFIX) && !expanded.has(id)) {
       fetchConnectionTables(id.slice(CONNECTION_ID_PREFIX.length));
+    } else if (id.startsWith(FOLDER_ID_PREFIX) && !expanded.has(id)) {
+      fetchFolder(id.slice(FOLDER_ID_PREFIX.length));
     }
     setExpanded((prev) => {
       const next = new Set(prev);
@@ -264,6 +338,17 @@ export function BrowserPanel({
           table: node.tableName,
         },
       });
+    } else if (node.kind === "file" && node.path && onAddFilePath) {
+      // Add the clicked file as a layer via the shell's dispatcher (which owns
+      // the vector/raster/MBTiles store add-paths); it resolves to an error
+      // message or null, surfaced inline like the recent-project open.
+      beginBusy(node.id);
+      try {
+        const addError = await onAddFilePath(node.path);
+        if (addError) setError(addError);
+      } finally {
+        endBusy();
+      }
     }
   };
 
@@ -271,11 +356,79 @@ export function BrowserPanel({
   // saving there adds it to the library/connections, which show up in this tree.
   const newConnection = (kind: AddDataKind) => openAddData(kind);
 
+  // The Files section's ＋ picks a folder to pin (native directory dialog); the
+  // pinned-folders change event refreshes the tree via useBrowserTree.
+  const addFolder = async () => {
+    setError(null);
+    try {
+      const picked = await pickLocalDirectory();
+      if (picked) pinFolder(picked);
+    } catch (err) {
+      console.error("Failed to add folder", err);
+      setError(t("browser.addFolderFailed"));
+    }
+  };
+
+  // A pinned root folder's (×) unpins it from the Files section. Also reset the
+  // folder and any expanded descendants — clear their cached listings + fetch
+  // markers and collapse them — so re-pinning the same path re-reads from disk
+  // and expands cleanly (toggle only fetches on a collapsed→expanded change;
+  // the panel stays mounted while hidden, so this state would otherwise persist).
+  //
+  // Note: this removes the pin from the UI/localStorage but does NOT revoke the
+  // underlying fs scope the picker granted (persisted app-wide via
+  // tauri-plugin-persisted-scope, see src-tauri/src/lib.rs) — there is no clean
+  // per-path "forget". Unpin means "stop listing it here", not "revoke access".
+  const removeFolder = (path: string) => {
+    setError(null);
+    // `path` may itself end in a separator (a normalized root: "/" or "C:\"),
+    // so build the descendant prefix from the path's own trailing separator
+    // rather than blindly appending one (which would yield "//" / "C:\\" and
+    // match no real descendant).
+    const separator = path.includes("\\") ? "\\" : "/";
+    const prefix = path.endsWith(separator) ? path : `${path}${separator}`;
+    const isWithin = (candidate: string) =>
+      candidate === path || candidate.startsWith(prefix);
+    for (const key of [...folderFetchedRef.current]) {
+      if (isWithin(key)) folderFetchedRef.current.delete(key);
+    }
+    // Invalidate any in-flight fetch for the folder/descendants so a late
+    // resolution can't repopulate cleared state.
+    for (const key of [...folderGenRef.current.keys()]) {
+      if (isWithin(key)) {
+        folderGenRef.current.set(key, (folderGenRef.current.get(key) ?? 0) + 1);
+      }
+    }
+    setFolderLoads((prev) => {
+      const next: Record<string, FolderLoad> = {};
+      for (const [key, value] of Object.entries(prev)) {
+        if (!isWithin(key)) next[key] = value;
+      }
+      return next;
+    });
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      for (const id of prev) {
+        if (
+          id.startsWith(FOLDER_ID_PREFIX) &&
+          isWithin(id.slice(FOLDER_ID_PREFIX.length))
+        ) {
+          next.delete(id);
+        }
+      }
+      return next;
+    });
+    unpinFolder(path);
+  };
+
   // A section counts as content if it has children *or* an always-on ＋ action
-  // (the Databases section shows its "New connection" ＋ even with zero saved
-  // connections, so a first-run user isn't stuck on the empty-state message).
+  // (Databases' "New connection" and Files' "Add folder" show even with zero
+  // entries, so a first-run user isn't stuck on the empty-state message).
   const hasContent = filtered.some(
-    (section) => section.children?.length || section.newConnectionKind,
+    (section) =>
+      section.children?.length ||
+      section.newConnectionKind ||
+      section.addFolderAction,
   );
 
   return (
@@ -310,6 +463,8 @@ export function BrowserPanel({
                 onToggle={toggle}
                 onActivate={activate}
                 onNewConnection={newConnection}
+                onAddFolder={addFolder}
+                onRemoveFolder={removeFolder}
               />
             ))}
           </ul>

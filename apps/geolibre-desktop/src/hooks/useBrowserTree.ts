@@ -11,6 +11,12 @@ import {
   readSavedPostgresConnections,
   savedPostgresConnectionLabel,
 } from "../lib/saved-postgres-connections";
+import {
+  folderLabel,
+  PINNED_FOLDERS_CHANGED_EVENT,
+  readPinnedFolders,
+} from "../lib/browser-folders";
+import { isTauri } from "../lib/tauri-io";
 import { buildBrowserTree, type BrowserNode } from "../lib/browser-tree";
 
 export interface BrowserTreeState {
@@ -39,16 +45,26 @@ export function useBrowserTree(): BrowserTreeState {
   const servicesLabel = t("browser.services");
   const recentLabel = t("browser.recent");
   const databasesLabel = t("browser.databases");
+  const filesLabel = t("browser.files");
 
   // Saved connections live in localStorage (no reactive store), so re-read them
   // when one is added/removed — otherwise a connection saved from the Add Data
-  // dialog wouldn't appear until the (still-mounted) panel is reopened.
+  // dialog wouldn't appear until the (still-mounted) panel is reopened. The
+  // pinned folders are the same story (see the Files section below).
   const [connectionsRevision, setConnectionsRevision] = useState(0);
+  const [foldersRevision, setFoldersRevision] = useState(0);
   useEffect(() => {
-    const bump = () => setConnectionsRevision((n) => n + 1);
-    window.addEventListener(POSTGRES_CONNECTIONS_CHANGED_EVENT, bump);
-    return () =>
-      window.removeEventListener(POSTGRES_CONNECTIONS_CHANGED_EVENT, bump);
+    const bumpConnections = () => setConnectionsRevision((n) => n + 1);
+    const bumpFolders = () => setFoldersRevision((n) => n + 1);
+    window.addEventListener(POSTGRES_CONNECTIONS_CHANGED_EVENT, bumpConnections);
+    window.addEventListener(PINNED_FOLDERS_CHANGED_EVENT, bumpFolders);
+    return () => {
+      window.removeEventListener(
+        POSTGRES_CONNECTIONS_CHANGED_EVENT,
+        bumpConnections,
+      );
+      window.removeEventListener(PINNED_FOLDERS_CHANGED_EVENT, bumpFolders);
+    };
   }, []);
 
   return useMemo(() => {
@@ -64,15 +80,29 @@ export function useBrowserTree(): BrowserTreeState {
         label: savedPostgresConnectionLabel(connectionString),
       }),
     );
+    // The Files section is desktop-only: directory reading uses the fs plugin's
+    // readDir, which only works within the scope the OS folder dialog grants, so
+    // the section lists the user's pinned folders (localStorage, MRU-first) that
+    // were added via the picker.
+    const files = isTauri()
+      ? {
+          folders: readPinnedFolders().map((path) => ({
+            path,
+            label: folderLabel(path),
+          })),
+        }
+      : undefined;
     return {
       tree: buildBrowserTree({
         services,
         recentProjects,
         databaseConnections,
+        files,
         sectionLabels: {
           services: servicesLabel,
           recent: recentLabel,
           databases: databasesLabel,
+          files: filesLabel,
         },
       }),
       serviceById: (id: string) => byId.get(id),
@@ -82,6 +112,8 @@ export function useBrowserTree(): BrowserTreeState {
     servicesLabel,
     recentLabel,
     databasesLabel,
+    filesLabel,
     connectionsRevision,
+    foldersRevision,
   ]);
 }

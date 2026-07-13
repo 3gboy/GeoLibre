@@ -6,6 +6,7 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import {
+  readDir,
   readFile,
   readTextFile,
   readTextFileLines,
@@ -175,6 +176,57 @@ const RESTORABLE_VECTOR_PATH = new RegExp(
  */
 export function isRestorableVectorPath(path: string): boolean {
   return RESTORABLE_VECTOR_PATH.test(path);
+}
+
+/**
+ * Whether a file name is a geospatial format the Browser panel's Files tree can
+ * add with one click — vectors and GeoTIFF/COG rasters. Deliberately stricter
+ * than the lenient drop-path filter (which accepts anything explicitly dropped).
+ * MBTiles are excluded for now: vector MBTiles need source-layer selection, so
+ * they go through the Add Data dialog rather than a one-click tree add.
+ *
+ * @param name - The file name (or path) to test.
+ * @returns True when the extension is a one-click-loadable geospatial format.
+ */
+export function isLoadableFilePath(name: string): boolean {
+  return isRestorableVectorPath(name) || isRasterFileName(name);
+}
+
+/** One entry of a local directory listing (from {@link listDirectory}). */
+export interface LocalDirectoryEntry {
+  name: string;
+  /** Absolute path of the entry. */
+  path: string;
+  isDirectory: boolean;
+}
+
+/**
+ * List a local directory's immediate entries via the `fs` plugin's `readDir`
+ * (desktop only; resolves to `[]` off-desktop). This works only within the fs
+ * scope the OS folder dialog grants for a picked directory (and its subtree),
+ * so the Browser panel only lists folders the user added via the picker — no
+ * new unbounded filesystem-read primitive. `readDir` returns names + type flags
+ * only, so the absolute path of each entry is joined here. Filtering to loadable
+ * file types is the caller's job.
+ *
+ * @param path - Absolute directory path to list (a picker-granted folder or a
+ *   descendant of one).
+ * @returns The directory's entries (folders and files).
+ */
+export async function listDirectory(
+  path: string,
+): Promise<LocalDirectoryEntry[]> {
+  if (!isTauri()) return [];
+  const entries = await readDir(path);
+  // Join with the parent's own separator style so a Windows path stays
+  // all-backslash (readDir returns names only, no path).
+  const sep = path.includes("\\") ? "\\" : "/";
+  const base = /[/\\]$/.test(path) ? path : `${path}${sep}`;
+  return entries.map((entry) => ({
+    name: entry.name,
+    path: `${base}${entry.name}`,
+    isDirectory: entry.isDirectory,
+  }));
 }
 
 // Built at call time so the filter-group label shown in the native file dialog
@@ -2073,6 +2125,24 @@ export async function pickLocalPathWithFallback(
   // require a real path. Return null so callers surface the desktop-only
   // message rather than passing a non-resolvable bare file name.
   return null;
+}
+
+/**
+ * Open the native folder picker and return the chosen directory (desktop only;
+ * null off-desktop or on cancel). `recursive: true` extends the granted fs scope
+ * to the picked directory's subtree, so the Browser panel can lazily {@link
+ * listDirectory} subfolders within it — not just its top level.
+ *
+ * @returns The picked absolute directory path, or null.
+ */
+export async function pickLocalDirectory(): Promise<string | null> {
+  if (!isTauri()) return null;
+  const selected = await open({
+    directory: true,
+    multiple: false,
+    recursive: true,
+  });
+  return typeof selected === "string" ? selected : null;
 }
 
 export async function pickSavePathWithFallback(

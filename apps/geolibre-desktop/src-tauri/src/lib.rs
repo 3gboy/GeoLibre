@@ -182,6 +182,18 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        // Must init after the fs plugin: it restores previously-granted fs
+        // scope (e.g. Browser-panel pinned folders) so they survive a restart.
+        //
+        // SECURITY / SCOPE NOTE (deliberate, maintainer-approved): this persists
+        // *every* dialog-granted fs scope for the life of the install, not just
+        // Browser-panel folder pins — "Open Vector File", "Open Raster", "Save
+        // Project As", etc. also extend fs scope to the picked path, and all of
+        // those now survive a restart. There is also no per-path "forget", so
+        // unpinning a folder in the Browser panel removes the UI pin but does
+        // not revoke its (persisted) read scope. Accepted for durable pins;
+        // revisit if a narrower per-source scope or a revoke path is wanted.
+        .plugin(tauri_plugin_persisted_scope::init())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_opener::init())
         .manage(EarthEngineOAuthState::default())
@@ -334,31 +346,10 @@ const RESTORABLE_VECTOR_EXTENSIONS: [&str; 17] = [
 /// Windows-style paths a project may carry regardless of the host the binary
 /// runs on.
 pub(crate) fn is_allowed_local_vector_path(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    let is_separator = |byte: u8| byte == b'/' || byte == b'\\';
-
-    // Reject UNC paths first. Both the Windows form ("\\server\share") and the
-    // forward-slash form ("//server/share") start with two separators and can
-    // make Windows auto-authenticate against a remote host, so neither may slip
-    // through the POSIX-absolute check below.
-    if bytes.len() >= 2 && is_separator(bytes[0]) && is_separator(bytes[1]) {
-        return false;
-    }
-
-    // Absolute local path only: POSIX "/..." or a Windows drive-letter "C:\..."
-    // / "C:/...".
-    let is_posix_absolute = bytes.first() == Some(&b'/');
-    let is_windows_drive = bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && is_separator(bytes[2]);
-    if !is_posix_absolute && !is_windows_drive {
-        return false;
-    }
-
-    // Reject a "/../" or "\..\" traversal segment (but not a ".." inside a
-    // filename like "v1..2.gpkg"), matching `hasPathTraversal`.
-    if path.split(['/', '\\']).any(|segment| segment == "..") {
+    // Absolute, non-UNC, no `..` traversal — split into `is_safe_absolute_path`
+    // so the security-relevant byte-parsing lives in one place rather than being
+    // duplicated.
+    if !is_safe_absolute_path(path) {
         return false;
     }
 
@@ -464,6 +455,28 @@ fn read_shapefile_siblings(path: String) -> Result<Vec<ShapefileSibling>, String
         }
     }
     Ok(siblings)
+}
+
+/// Whether `path` is a safe absolute local path: an absolute POSIX (`/...`) or
+/// Windows drive-letter (`C:\...`) path, never a UNC (`\\host\share`) share, and
+/// free of `..` traversal segments. The shared absolute/non-UNC/no-traversal
+/// guard behind [`is_allowed_local_vector_path`], kept separate so that
+/// byte-parsing lives in one place rather than being duplicated per caller.
+fn is_safe_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    let is_separator = |byte: u8| byte == b'/' || byte == b'\\';
+    if bytes.len() >= 2 && is_separator(bytes[0]) && is_separator(bytes[1]) {
+        return false;
+    }
+    let is_posix_absolute = bytes.first() == Some(&b'/');
+    let is_windows_drive = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && is_separator(bytes[2]);
+    if !is_posix_absolute && !is_windows_drive {
+        return false;
+    }
+    !path.split(['/', '\\']).any(|segment| segment == "..")
 }
 
 /// Read the optional admin UI-profile file (`<app_config_dir>/admin-profile.json`).
@@ -2861,7 +2874,7 @@ fn configure_linux_webkit() {}
 mod tests {
     use super::{
         ensure_fetchable_url, find_zip_manifest_path, is_allowed_local_vector_path,
-        is_allowed_project_path, is_disallowed_ip, plugin_archive_file_name,
+        is_allowed_project_path, is_disallowed_ip, is_safe_absolute_path, plugin_archive_file_name,
     };
     use std::io::{Cursor, Write};
     use std::net::IpAddr;
@@ -3041,5 +3054,30 @@ mod tests {
         assert_eq!(plugin_archive_file_name("..hidden"), "hidden.zip");
         // A name that sanitizes away entirely falls back to a fixed stem.
         assert_eq!(plugin_archive_file_name("..."), "plugin.zip");
+    }
+
+    #[test]
+    fn is_safe_absolute_path_accepts_absolute_local_dirs() {
+        assert!(is_safe_absolute_path("/home/user/data"));
+        assert!(is_safe_absolute_path("/data"));
+        assert!(is_safe_absolute_path("C:\\Users\\me\\gis"));
+        assert!(is_safe_absolute_path("C:/Users/me/gis"));
+        // A ".." inside a name (not a traversal segment) is fine.
+        assert!(is_safe_absolute_path("/home/user/v1..2"));
+    }
+
+    #[test]
+    fn is_safe_absolute_path_rejects_unc_traversal_and_relative() {
+        // UNC shares (both forms) can auto-authenticate against a remote host.
+        assert!(!is_safe_absolute_path("\\\\server\\share"));
+        assert!(!is_safe_absolute_path("//server/share"));
+        // `..` traversal segments.
+        assert!(!is_safe_absolute_path("/home/user/../etc"));
+        assert!(!is_safe_absolute_path("C:\\a\\..\\b"));
+        // Relative / non-absolute and empty input.
+        assert!(!is_safe_absolute_path("home/user"));
+        assert!(!is_safe_absolute_path("./data"));
+        assert!(!is_safe_absolute_path(""));
+        assert!(!is_safe_absolute_path("C:")); // drive letter without a separator
     }
 }
