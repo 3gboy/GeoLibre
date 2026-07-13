@@ -1,15 +1,27 @@
 import { useAppStore } from "@geolibre/core";
 import type { MapController } from "@geolibre/map";
+import { fetchPostgisStatus, listPostgisTables } from "@geolibre/processing";
 import { Input, ScrollArea } from "@geolibre/ui";
 import { Search } from "lucide-react";
-import { useMemo, useRef, useState, type RefObject } from "react";
+import { useCallback, useMemo, useRef, useState, type RefObject } from "react";
 import { useTranslation } from "react-i18next";
+import { startGeoLibreSidecar } from "../../lib/sidecar";
+import { isTauri } from "../../lib/tauri-io";
 import { useBrowserTree } from "../../hooks/useBrowserTree";
-import { filterBrowserTree, type BrowserNode } from "../../lib/browser-tree";
+import {
+  augmentConnections,
+  filterBrowserTree,
+  type BrowserNode,
+  type ConnectionLoad,
+} from "../../lib/browser-tree";
 import { applyServiceEntry } from "../layout/add-data/apply-service";
+import { errorMessage } from "../layout/add-data/helpers";
+import type { AddDataKind } from "../layout/AddDataDialog";
 import { openAddData } from "../layout/add-data/open-add-data";
-import type { ServiceLibraryKind } from "../layout/add-data/service-library";
 import { BrowserTreeNode } from "./BrowserTreeNode";
+
+/** The `connection:` id prefix a connection node carries (id = prefix + connString). */
+const CONNECTION_ID_PREFIX = "connection:";
 
 interface BrowserPanelProps {
   mapControllerRef: RefObject<MapController | null>;
@@ -21,7 +33,11 @@ interface BrowserPanelProps {
 }
 
 /** The section nodes are expanded by default so their contents are visible. */
-const DEFAULT_EXPANDED = new Set(["section:services", "section:recent"]);
+const DEFAULT_EXPANDED = new Set([
+  "section:services",
+  "section:recent",
+  "section:databases",
+]);
 
 /** Collects every group node id in a tree (used to expand-all while searching). */
 function collectGroupIds(nodes: readonly BrowserNode[], into: Set<string>): void {
@@ -74,9 +90,106 @@ export function BrowserPanel({
     setBusyId(null);
   };
 
+  // Lazy PostGIS introspection: keyed by connection string, populated the first
+  // time a connection node is expanded so we never hit the sidecar for a
+  // connection the user hasn't opened.
+  const [connLoads, setConnLoads] = useState<Record<string, ConnectionLoad>>(
+    {},
+  );
+  // Tracks in-flight/settled fetches so a re-expand (or the expand-all a search
+  // triggers) doesn't refetch. A failed fetch drops its entry so re-expanding
+  // the connection retries (there is no separate refresh affordance).
+  const connFetchedRef = useRef<Set<string>>(new Set());
+
+  const fetchConnectionTables = useCallback(
+    (connectionString: string) => {
+      if (connFetchedRef.current.has(connectionString)) return;
+      connFetchedRef.current.add(connectionString);
+      // PostGIS browsing needs the desktop sidecar/Martin; off-Tauri, show the
+      // same localized "requires GeoLibre Desktop" message the Add Data dialog
+      // gives rather than letting startGeoLibreSidecar/fetch fail with a raw
+      // network error. Dropped from the fetched set so it can retry on desktop.
+      if (!isTauri()) {
+        connFetchedRef.current.delete(connectionString);
+        setConnLoads((prev) => ({
+          ...prev,
+          [connectionString]: {
+            status: "error",
+            message: t("addData.postgres.errorDesktopOnly"),
+          },
+        }));
+        return;
+      }
+      setConnLoads((prev) => ({
+        ...prev,
+        [connectionString]: { status: "loading" },
+      }));
+      // The desktop sidecar is spawned on demand and only authenticated after
+      // startGeoLibreSidecar runs, so ensure it is up before hitting /postgis —
+      // best-effort, mirroring PostgresSource.handleConnectEditable (a failed
+      // start still lets the status/list calls surface the real error).
+      void startGeoLibreSidecar()
+        .catch(() => {})
+        .then(() => fetchPostgisStatus())
+        .then((status) => {
+          // Same runtime gate as the Add Data dialog, so a missing postgis
+          // extra reads as the friendly "install the extra" message rather
+          // than a raw connection error from /postgis/tables.
+          if (!status.available) {
+            throw new Error(t("addData.postgres.errorRuntimeMissing"));
+          }
+          return listPostgisTables(connectionString);
+        })
+        .then((tables) => {
+          // geometry_columns returns one row per geometry column, so a table
+          // with several geometry columns appears several times; keep the first
+          // (mirrors PostgresSource.handleConnectEditable's dedup) so the tree
+          // doesn't emit duplicate node ids.
+          const seen = new Set<string>();
+          const deduped: { schema: string; table: string }[] = [];
+          for (const tbl of tables) {
+            const key = `${tbl.schema}.${tbl.table}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            deduped.push({ schema: tbl.schema, table: tbl.table });
+          }
+          setConnLoads((prev) => ({
+            ...prev,
+            [connectionString]: { status: "loaded", tables: deduped },
+          }));
+        })
+        .catch((err: unknown) => {
+          // Allow a retry: drop the fetched marker so collapsing and
+          // re-expanding the connection re-runs introspection rather than
+          // sticking on the error. Reuse the Add Data errorMessage helper for a
+          // translated fallback, matching the dialog's PostGIS entry point.
+          connFetchedRef.current.delete(connectionString);
+          setConnLoads((prev) => ({
+            ...prev,
+            [connectionString]: {
+              status: "error",
+              message: errorMessage(err, t("addData.postgres.errorConnect")),
+            },
+          }));
+        });
+    },
+    [t],
+  );
+
+  // Inject each connection node's lazily-loaded children (loading/error status
+  // rows, or schema→table nodes) before filtering. Search therefore reaches the
+  // tables of connections the user has already expanded; an unexpanded
+  // connection keeps its empty child list, so its tables aren't searchable
+  // until it is first drilled into.
+  const loadingLabel = t("browser.loadingTables");
+  const augmented = useMemo(
+    () => augmentConnections(tree, connLoads, loadingLabel),
+    [tree, connLoads, loadingLabel],
+  );
+
   const filtered = useMemo(
-    () => filterBrowserTree(tree, query),
-    [tree, query],
+    () => filterBrowserTree(augmented, query),
+    [augmented, query],
   );
 
   // While searching, expand every group so matches deep in the tree are
@@ -88,13 +201,18 @@ export function BrowserPanel({
     return all;
   }, [query, expanded, filtered]);
 
-  const toggle = (id: string) =>
+  const toggle = (id: string) => {
+    // Kick off introspection the first time a connection is expanded.
+    if (id.startsWith(CONNECTION_ID_PREFIX) && !expanded.has(id)) {
+      fetchConnectionTables(id.slice(CONNECTION_ID_PREFIX.length));
+    }
     setExpanded((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
       return next;
     });
+  };
 
   const activate = async (node: BrowserNode) => {
     // Ignore a second activation while one is still resolving (a fast
@@ -135,15 +253,30 @@ export function BrowserPanel({
       } finally {
         endBusy();
       }
+    } else if (node.kind === "table" && node.connectionString) {
+      // Reuse the proven PostgreSQL Add Data flow (desktop Martin lifecycle) to
+      // add the table as a layer, opening it prefilled with this connection and
+      // table so the user only confirms.
+      openAddData("postgres", {
+        postgres: {
+          connection: node.connectionString,
+          schema: node.tableSchema,
+          table: node.tableName,
+        },
+      });
     }
   };
 
-  // "New connection" on a service-kind group opens the Add Data dialog at that
-  // source; saving there adds it to the library, which shows up in this tree.
-  // ServiceLibraryKind is a subset of AddDataKind, so no cast is needed.
-  const newConnection = (kind: ServiceLibraryKind) => openAddData(kind);
+  // A group's "New connection" (＋) opens the Add Data dialog at that source;
+  // saving there adds it to the library/connections, which show up in this tree.
+  const newConnection = (kind: AddDataKind) => openAddData(kind);
 
-  const hasContent = filtered.some((section) => section.children?.length);
+  // A section counts as content if it has children *or* an always-on ＋ action
+  // (the Databases section shows its "New connection" ＋ even with zero saved
+  // connections, so a first-run user isn't stuck on the empty-state message).
+  const hasContent = filtered.some(
+    (section) => section.children?.length || section.newConnectionKind,
+  );
 
   return (
     // Body only: the shell (PluginRightPanel / SharedSidebar) renders the header,

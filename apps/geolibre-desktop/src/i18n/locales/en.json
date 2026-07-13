@@ -3,13 +3,16 @@
     "title": "Browser",
     "services": "Services",
     "recent": "Recent",
+    "databases": "Databases",
+    "newDatabaseConnection": "New database connection",
     "searchPlaceholder": "Search data sources",
     "empty": "No saved services or recent projects yet.",
     "emptyGroup": "Empty",
     "noMatches": "No matches.",
     "addFailed": "Could not add this data source.",
     "builtinBadge": "built-in",
-    "newConnection": "New {{kind}} connection"
+    "newConnection": "New {{kind}} connection",
+    "loadingTables": "Loading tables…"
   },
   "about": {
     "trigger": "About",

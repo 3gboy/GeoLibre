@@ -2,9 +2,12 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { RecentProjectEntry } from "@geolibre/core";
 import {
+  augmentConnections,
   buildBrowserTree,
+  buildPostgisTableNodes,
   filterBrowserTree,
   type BrowserNode,
+  type ConnectionLoad,
 } from "../apps/geolibre-desktop/src/lib/browser-tree";
 import type {
   ServiceLibraryEntry,
@@ -77,10 +80,10 @@ describe("buildBrowserTree", () => {
       ["kind:xyz", "kind:wms", "kind:arcgis"],
     );
     assert.equal(services.count, 3);
-    // Each kind group carries its kind so the panel's "New connection" action
-    // can open the matching Add Data source.
-    assert.equal(find(tree, "kind:wms")?.serviceKind, "wms");
-    assert.equal(find(tree, "kind:arcgis")?.serviceKind, "arcgis");
+    // Each kind group carries the Add Data source its "New connection" action
+    // opens.
+    assert.equal(find(tree, "kind:wms")?.newConnectionKind, "wms");
+    assert.equal(find(tree, "kind:arcgis")?.newConnectionKind, "arcgis");
   });
 
   it("sorts services within a kind by name", () => {
@@ -128,6 +131,38 @@ describe("buildBrowserTree", () => {
     assert.equal(find(tree, "section:recent")?.label, "Recientes");
   });
 
+  it("omits the Databases section unless connections are provided", () => {
+    const tree = buildBrowserTree({ services: [], recentProjects: [] });
+    assert.equal(find(tree, "section:databases"), undefined);
+    assert.deepEqual(
+      tree.map((n) => n.id),
+      ["section:services", "section:recent"],
+    );
+  });
+
+  it("adds a Databases section with connection leaves + a postgres ＋", () => {
+    const tree = buildBrowserTree({
+      services: [],
+      recentProjects: [],
+      databaseConnections: [
+        { connectionString: "postgres://u@h/db", label: "db @ h" },
+      ],
+    });
+    const db = find(tree, "section:databases");
+    assert.equal(db?.kind, "section");
+    // The section's ＋ opens the Add Data PostgreSQL source.
+    assert.equal(db?.newConnectionKind, "postgres");
+    assert.equal(db?.count, 1);
+    const conn = find(tree, "connection:postgres://u@h/db");
+    assert.equal(conn?.kind, "connection");
+    assert.equal(conn?.connectionString, "postgres://u@h/db");
+    assert.equal(conn?.label, "db @ h");
+    // A connection is an expandable group (empty children until introspected),
+    // not an addable leaf.
+    assert.equal(conn?.addable, false);
+    assert.deepEqual(conn?.children, []);
+  });
+
   it("lists recent projects in the given order with their paths", () => {
     const tree = buildBrowserTree({ services: [], recentProjects: RECENT });
     const recent = tree[1];
@@ -139,6 +174,108 @@ describe("buildBrowserTree", () => {
     assert.equal(one?.kind, "recent-project");
     assert.equal(one?.projectPath, "/a/one.geolibre.json");
     assert.equal(one?.addable, true);
+  });
+});
+
+describe("buildPostgisTableNodes", () => {
+  const CONN = "postgresql://u@h/db";
+
+  it("groups tables into schema → table nodes, sorted by name", () => {
+    const nodes = buildPostgisTableNodes(CONN, [
+      { schema: "public", table: "roads" },
+      { schema: "public", table: "buildings" },
+      { schema: "census", table: "tracts" },
+    ]);
+    // Schemas sorted alphabetically.
+    assert.deepEqual(
+      nodes.map((n) => n.label),
+      ["census", "public"],
+    );
+    assert.equal(nodes[0].kind, "schema");
+    assert.equal(nodes[0].id, `schema:${CONN}:census`);
+    assert.equal(nodes[0].count, 1);
+    // Tables within a schema sorted alphabetically.
+    const publicSchema = nodes[1];
+    assert.equal(publicSchema.count, 2);
+    assert.deepEqual(
+      publicSchema.children?.map((c) => c.label),
+      ["buildings", "roads"],
+    );
+  });
+
+  it("carries the connection, schema, and table onto each table node", () => {
+    const nodes = buildPostgisTableNodes(CONN, [
+      { schema: "public", table: "roads" },
+    ]);
+    const table = nodes[0].children?.[0];
+    assert.equal(table?.kind, "table");
+    assert.equal(table?.id, `table:${CONN}:public.roads`);
+    assert.equal(table?.label, "roads");
+    assert.equal(table?.addable, true);
+    assert.equal(table?.connectionString, CONN);
+    assert.equal(table?.tableSchema, "public");
+    assert.equal(table?.tableName, "roads");
+  });
+
+  it("returns an empty array for no tables", () => {
+    assert.deepEqual(buildPostgisTableNodes(CONN, []), []);
+  });
+});
+
+describe("augmentConnections", () => {
+  const CONN = "postgres://u@h/db";
+  const baseTree = () =>
+    buildBrowserTree({
+      services: [],
+      recentProjects: [],
+      databaseConnections: [{ connectionString: CONN, label: "db @ h" }],
+    });
+
+  function augment(load?: ConnectionLoad): BrowserNode | undefined {
+    const loads = load ? { [CONN]: load } : {};
+    const out = augmentConnections(baseTree(), loads, "Loading tables…");
+    return find(out, `connection:${CONN}`);
+  }
+
+  it("leaves an un-introspected connection with empty children", () => {
+    assert.deepEqual(augment()?.children, []);
+  });
+
+  it("shows a single loading info row while loading", () => {
+    const children = augment({ status: "loading" })?.children;
+    assert.equal(children?.length, 1);
+    assert.equal(children?.[0].kind, "info");
+    assert.equal(children?.[0].id, `connection:${CONN}:loading`);
+    assert.equal(children?.[0].label, "Loading tables…");
+  });
+
+  it("shows the error message in an info row on error", () => {
+    const children = augment({ status: "error", message: "boom" })?.children;
+    assert.equal(children?.length, 1);
+    assert.equal(children?.[0].kind, "info");
+    assert.equal(children?.[0].id, `connection:${CONN}:error`);
+    assert.equal(children?.[0].label, "boom");
+  });
+
+  it("builds schema→table children once loaded", () => {
+    const children = augment({
+      status: "loaded",
+      tables: [
+        { schema: "public", table: "roads" },
+        { schema: "census", table: "tracts" },
+      ],
+    })?.children;
+    assert.deepEqual(
+      children?.map((c) => c.label),
+      ["census", "public"],
+    );
+    assert.equal(find([children![1]], `table:${CONN}:public.roads`)?.kind, "table");
+  });
+
+  it("does not mutate the input tree", () => {
+    const tree = baseTree();
+    augmentConnections(tree, { [CONN]: { status: "loading" } }, "Loading…");
+    assert.deepEqual(find(tree, `connection:${CONN}`)?.children, []);
   });
 });
 
