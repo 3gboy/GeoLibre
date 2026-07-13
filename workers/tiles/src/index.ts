@@ -61,6 +61,29 @@ const DATASETS: Record<string, string> = {
 // Worker can never be coerced into fetching an arbitrary upstream path.
 const TILE_PATH = /^\/opm\/([a-z0-9-]+)\/(\d{1,2})\/(\d{1,7})\/(\d{1,7})\.png$/;
 
+// OpenAerialMap metadata search proxy. The OAM `/meta` API only sends CORS
+// headers for the OAM web app origin, so a browser fetch from GeoLibre is
+// blocked; this route fetches it server-side (no CORS applies server-to-server)
+// and re-emits the JSON with `Access-Control-Allow-Origin: *` — the same thing
+// leafmap.oam_search gets for free by calling the API from Python. The upstream
+// path is fixed and only an allowlist of query params is forwarded, so this
+// stays a named proxy, never an open one.
+const OAM_META_PATH = "/oam/meta";
+const OAM_META_UPSTREAM = "https://api.openaerialmap.org/meta";
+const OAM_META_PARAMS = new Set([
+  "bbox",
+  "limit",
+  "page",
+  "order_by",
+  "sort",
+  "acquisition_from",
+  "acquisition_to",
+]);
+// Searches change as imagery is added, so cache only briefly at the edge.
+const OAM_CACHE_CONTROL = "public, max-age=120";
+// Upper bound on the forwarded `limit` (OAM's own page-size ceiling).
+const OAM_MAX_LIMIT = 100;
+
 // A USGS Astrogeology WMS layer to reproject. `map` and `layer` are the only
 // caller-influenced parts of the upstream request, and both come from this
 // allowlist — the Worker never forwards a client-supplied WMS parameter.
@@ -160,6 +183,49 @@ const CACHE_CONTROL = "public, max-age=3600, s-maxage=86400";
 // buckets every time.
 const NEGATIVE_CACHE_CONTROL = "public, max-age=300";
 
+/**
+ * Whether an `Origin` header may use the OpenAerialMap search proxy. Allowed:
+ *
+ *   - the production web app on `*.geolibre.app` (any subdomain, plus the apex)
+ *   - Cloudflare Pages deploy previews (project `geolibre-preview`) and
+ *     `*.workers.dev` preview deployments
+ *   - local dev on `localhost` / `127.0.0.1`
+ *
+ * Everything else gets a 403 so the route can't be driven as an open proxy from
+ * an arbitrary third-party site. This route is only reached by the web, dev, and
+ * embed builds; the desktop app fetches OAM through native (CORS-bypassing) HTTP
+ * and never hits the Worker. The Jupyter embed runs on arbitrary origins, so its
+ * OAM search is intentionally not proxied here (planetary tiles are unaffected —
+ * only this `/oam/meta` route is origin-gated).
+ *
+ * `.geolibre.app` etc. are matched with a leading dot so a look-alike apex like
+ * `evilgeolibre.app` cannot pass as a subdomain.
+ */
+function isAllowedOamOrigin(origin: string | null): boolean {
+  if (!origin) return false;
+  let hostname: string;
+  let protocol: string;
+  try {
+    ({ hostname, protocol } = new URL(origin));
+  } catch {
+    return false;
+  }
+  if (protocol === "https:") {
+    if (hostname === "geolibre.app" || hostname.endsWith(".geolibre.app")) {
+      return true;
+    }
+    if (hostname.endsWith(".geolibre-preview.pages.dev")) return true;
+    if (hostname.endsWith(".workers.dev")) return true;
+  }
+  if (
+    (protocol === "http:" || protocol === "https:") &&
+    (hostname === "localhost" || hostname === "127.0.0.1")
+  ) {
+    return true;
+  }
+  return false;
+}
+
 interface Env {}
 
 export default {
@@ -184,11 +250,12 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === "/" || url.pathname === "") {
       return new Response(
-        "GeoLibre planetary tile service.\n" +
+        "GeoLibre tile + service proxy.\n" +
           "  Passthrough: /opm/<dataset>/<z>/<x>/<y>.png\n" +
           `    Datasets: ${Object.keys(DATASETS).join(", ")}\n` +
           "  Reprojected WMS: /wms/<dataset>/<z>/<x>/<y>.png\n" +
-          `    Datasets: ${Object.keys(WMS_DATASETS).join(", ")}\n`,
+          `    Datasets: ${Object.keys(WMS_DATASETS).join(", ")}\n` +
+          "  OpenAerialMap search: /oam/meta?bbox=...&limit=...\n",
         { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } },
       );
     }
@@ -196,6 +263,63 @@ export default {
     const wmsMatch = WMS_PATH.exec(url.pathname);
     if (wmsMatch) {
       return handleWmsTile(request, wmsMatch, ctx);
+    }
+
+    // OpenAerialMap metadata search: forward the allowlisted query params to the
+    // fixed upstream and re-emit the JSON with CORS (see OAM_META_PATH above).
+    if (url.pathname === OAM_META_PATH) {
+      // Abuse guard: this is a wildcard-CORS proxy to a fixed upstream, so
+      // restrict it to GeoLibre's own origins (see isAllowedOamOrigin) — every
+      // cross-origin `fetch()` from the app carries an Origin header. This stops
+      // a third-party site from driving arbitrary OAM queries through the
+      // Worker. It is not a rate limiter — per-client throttling belongs in a
+      // Cloudflare rate-limiting rule in front of tiles.geolibre.app.
+      if (!isAllowedOamOrigin(request.headers.get("origin"))) {
+        return new Response("Forbidden", { status: 403, headers: CORS_HEADERS });
+      }
+      const upstream = new URL(OAM_META_UPSTREAM);
+      for (const [key, value] of url.searchParams) {
+        if (!OAM_META_PARAMS.has(key)) continue;
+        if (key === "limit") {
+          // Clamp so this named proxy can't be driven to request huge pages.
+          const n = Number(value);
+          const limit = Number.isFinite(n)
+            ? Math.min(Math.max(Math.trunc(n), 1), OAM_MAX_LIMIT)
+            : OAM_MAX_LIMIT;
+          upstream.searchParams.set("limit", String(limit));
+        } else {
+          upstream.searchParams.append(key, value);
+        }
+      }
+      let originResponse: Response;
+      try {
+        originResponse = await fetch(upstream.toString(), {
+          headers: { accept: "application/json" },
+          // cacheEverything is required for Cloudflare to edge-cache a URL with
+          // no static file extension (cacheTtl alone does not).
+          cf: { cacheEverything: true, cacheTtl: 120 },
+        });
+      } catch {
+        return new Response("Bad Gateway", {
+          status: 502,
+          headers: CORS_HEADERS,
+        });
+      }
+      const headers = new Headers(CORS_HEADERS);
+      headers.set(
+        "content-type",
+        originResponse.headers.get("content-type") ?? "application/json",
+      );
+      // Only cache successful searches; a transient upstream error/throttle must
+      // not be pinned in the browser for the OAM cache TTL.
+      headers.set(
+        "cache-control",
+        originResponse.ok ? OAM_CACHE_CONTROL : "no-store",
+      );
+      return new Response(originResponse.body, {
+        status: originResponse.status,
+        headers,
+      });
     }
 
     const match = TILE_PATH.exec(url.pathname);
