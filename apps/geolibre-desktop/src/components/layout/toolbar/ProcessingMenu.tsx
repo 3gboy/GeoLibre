@@ -49,6 +49,10 @@ export function ProcessingMenu({
   const setModelBuilderOpen = useAppStore((s) => s.setModelBuilderOpen);
   const setRasterToolOpen = useAppStore((s) => s.setRasterToolOpen);
   const setSegmentationOpen = useAppStore((s) => s.setSegmentationOpen);
+  const setObjectDetectionOpen = useAppStore((s) => s.setObjectDetectionOpen);
+  const setSegmentEverythingOpen = useAppStore(
+    (s) => s.setSegmentEverythingOpen,
+  );
   const setSqlWorkspaceOpen = useAppStore((s) => s.setSqlWorkspaceOpen);
   const setPythonConsoleOpen = useAppStore((s) => s.setPythonConsoleOpen);
   const setNotebookOpen = useAppStore((s) => s.setNotebookOpen);
@@ -88,7 +92,9 @@ export function ProcessingMenu({
   const showGeolibreActions =
     show("processing.geocode") ||
     show("processing.modelBuilder") ||
-    (!mobile && show("processing.segmentation"));
+    (!mobile && show("processing.segmentation")) ||
+    show("processing.objectDetection") ||
+    show("processing.segmentEverything");
   const showGeolibre = showGeolibreTools || showGeolibreActions;
   const showWorkspacesOrServices =
     show("processing.sqlWorkspace") ||
@@ -508,6 +514,20 @@ export function ProcessingMenu({
         {!mobile && show("processing.segmentation") && (
           <DropdownMenuItem onSelect={() => setSegmentationOpen(true)}>
             {t("toolbar.command.segmentation")}
+          </DropdownMenuItem>
+        )}
+        {/* Detection runs client-side (onnxruntime-web), not via the sidecar,
+            so it stays available on mobile/web clients (no `!mobile` gate). */}
+        {show("processing.objectDetection") && (
+          <DropdownMenuItem onSelect={() => setObjectDetectionOpen(true)}>
+            {t("toolbar.command.objectDetection")}
+          </DropdownMenuItem>
+        )}
+        {/* SlimSAM "segment everything" also runs client-side (onnxruntime-web),
+            so it stays available on mobile/web clients (no `!mobile` gate). */}
+        {show("processing.segmentEverything") && (
+          <DropdownMenuItem onSelect={() => setSegmentEverythingOpen(true)}>
+            {t("toolbar.command.segmentEverything")}
           </DropdownMenuItem>
         )}
           </DropdownMenuSubContent>
